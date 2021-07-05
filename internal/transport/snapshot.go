@@ -34,8 +34,9 @@
 package transport
 
 import (
-	"errors"
 	"sync/atomic"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/settings"
@@ -80,18 +81,39 @@ func (t *Transport) getStreamSink(clusterID uint64, nodeID uint64) *Sink {
 	}
 	key := raftio.GetNodeInfo(clusterID, nodeID)
 	if job := t.createJob(key, addr, true, 0); job != nil {
+		shutdown := func() {
+			atomic.AddUint64(&t.jobs, ^uint64(0))
+		}
+		t.stopper.RunWorker(func() {
+			t.processSnapshot(job, addr)
+			shutdown()
+		})
 		return &Sink{j: job}
 	}
 	return nil
 }
 
 func (t *Transport) sendSnapshot(m pb.Message) bool {
+	if !t.doSendSnapshot(m) {
+		if err := m.Snapshot.Unref(); err != nil {
+			panic(err)
+		}
+		return false
+	}
+	return true
+}
+
+func (t *Transport) doSendSnapshot(m pb.Message) bool {
 	toNodeID := m.To
 	clusterID := m.ClusterId
 	if m.Type != pb.InstallSnapshot {
 		panic("not a snapshot message")
 	}
-	chunks := splitSnapshotMessage(m, t.fs)
+	chunks, err := splitSnapshotMessage(m, t.fs)
+	if err != nil {
+		plog.Errorf("failed to get snapshot chunks %+v", err)
+		return false
+	}
 	addr, _, err := t.resolver.Resolve(clusterID, toNodeID)
 	if err != nil {
 		return false
@@ -105,7 +127,17 @@ func (t *Transport) sendSnapshot(m pb.Message) bool {
 	if job == nil {
 		return false
 	}
-	job.addSnapshot(m)
+	shutdown := func() {
+		atomic.AddUint64(&t.jobs, ^uint64(0))
+		if err := m.Snapshot.Unref(); err != nil {
+			panic(err)
+		}
+	}
+	t.stopper.RunWorker(func() {
+		t.processSnapshot(job, addr)
+		shutdown()
+	})
+	job.addSnapshot(chunks)
 	return true
 }
 
@@ -120,13 +152,6 @@ func (t *Transport) createJob(key raftio.NodeInfo,
 		streaming, sz, t.trans, t.stopper.ShouldStop(), t.fs)
 	job.postSend = t.postSend
 	job.preSend = t.preSend
-	shutdown := func() {
-		atomic.AddUint64(&t.jobs, ^uint64(0))
-	}
-	t.stopper.RunWorker(func() {
-		t.processSnapshot(job, addr)
-		shutdown()
-	})
 	return job
 }
 
@@ -234,10 +259,10 @@ func getChunks(m pb.Message) []pb.Chunk {
 	return results
 }
 
-func getWitnessChunk(m pb.Message, fs vfs.IFS) []pb.Chunk {
+func getWitnessChunk(m pb.Message, fs vfs.IFS) ([]pb.Chunk, error) {
 	ss, err := rsm.GetWitnessSnapshot(fs)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	results := make([]pb.Chunk, 0)
 	results = append(results, pb.Chunk{
@@ -259,31 +284,33 @@ func getWitnessChunk(m pb.Message, fs vfs.IFS) []pb.Chunk {
 		Witness:        true,
 		Data:           ss,
 	})
-	return results
+	return results, nil
 }
 
-func splitSnapshotMessage(m pb.Message, fs vfs.IFS) []pb.Chunk {
+func splitSnapshotMessage(m pb.Message, fs vfs.IFS) ([]pb.Chunk, error) {
 	if m.Type != pb.InstallSnapshot {
 		panic("not a snapshot message")
 	}
 	if m.Snapshot.Witness {
 		return getWitnessChunk(m, fs)
 	}
-	return getChunks(m)
+	return getChunks(m), nil
 }
 
 func loadChunkData(chunk pb.Chunk,
-	data []byte, fs vfs.IFS) ([]byte, error) {
-	f, err := OpenChunkFileForRead(chunk.Filepath, fs)
+	data []byte, fs vfs.IFS) (result []byte, err error) {
+	f, err := openChunkFileForRead(chunk.Filepath, fs)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		err = firstError(err, f.close())
+	}()
 	offset := chunk.FileChunkId * snapshotChunkSize
 	if chunk.ChunkSize != uint64(len(data)) {
 		data = make([]byte, chunk.ChunkSize)
 	}
-	n, err := f.ReadAt(data, int64(offset))
+	n, err := f.readAt(data, int64(offset))
 	if err != nil {
 		return nil, err
 	}

@@ -16,9 +16,9 @@ package transport
 
 import (
 	"context"
-	"errors"
 	"sync"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/syncutil"
 
 	"github.com/lni/dragonboat/v3/config"
@@ -80,10 +80,7 @@ func (cc *ChanConnection) SendMessageBatch(batch pb.MessageBatch) error {
 	if cc.cc.snapshot {
 		panic("sending message on snapshot cc")
 	}
-	data, err := batch.Marshal()
-	if err != nil {
-		panic(err)
-	}
+	data := pb.MustMarshal(&batch)
 	select {
 	case <-cc.cc.recverClosed:
 		return ErrClosed
@@ -107,10 +104,7 @@ func (csc *ChanSSConnection) SendChunk(chunk pb.Chunk) error {
 	if !csc.cc.snapshot {
 		panic("sending snapshot data on regular cc")
 	}
-	data, err := chunk.Marshal()
-	if err != nil {
-		panic(err)
-	}
+	data := pb.MustMarshal(&chunk)
 	select {
 	case <-csc.cc.recverClosed:
 		return ErrClosed
@@ -125,6 +119,7 @@ type ChanTransport struct {
 	requestHandler raftio.MessageHandler
 	chunkHandler   raftio.ChunkHandler
 	stopper        *syncutil.Stopper
+	connStopper    *syncutil.Stopper
 }
 
 // NewChanTransport creates a new channel based test transport module.
@@ -136,6 +131,7 @@ func NewChanTransport(nhConfig config.NodeHostConfig,
 		requestHandler: requestHandler,
 		chunkHandler:   chunkHandler,
 		stopper:        syncutil.NewStopper(),
+		connStopper:    syncutil.NewStopper(),
 	}
 }
 
@@ -162,7 +158,7 @@ func (ct *ChanTransport) Start() error {
 				}()
 				return
 			case cc := <-acc.ac:
-				ct.stopper.RunWorker(func() {
+				ct.connStopper.RunWorker(func() {
 					ct.serveConn(cc)
 				})
 			}
@@ -171,9 +167,11 @@ func (ct *ChanTransport) Start() error {
 	return nil
 }
 
-// Stop ...
-func (ct *ChanTransport) Stop() {
+// Close ...
+func (ct *ChanTransport) Close() error {
 	ct.stopper.Stop()
+	ct.connStopper.Stop()
+	return nil
 }
 
 // Name ...

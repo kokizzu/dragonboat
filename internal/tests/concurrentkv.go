@@ -20,13 +20,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
+	"github.com/lni/dragonboat/v3/internal/fileutil"
 	"github.com/lni/dragonboat/v3/internal/tests/kvpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
 )
@@ -183,7 +183,7 @@ func (s *ConcurrentKVTest) RecoverFromSnapshot(r io.Reader,
 	}
 	kvdata := &kvdata{}
 	jsondata := &KVJson{}
-	data, err := ioutil.ReadAll(r)
+	data, err := fileutil.ReadAll(r)
 	if err != nil {
 		return err
 	}

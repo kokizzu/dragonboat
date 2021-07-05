@@ -63,39 +63,31 @@ type Peer struct {
 // Launch starts or restarts a Raft node.
 func Launch(config config.Config,
 	logdb ILogDB, events server.IRaftEventListener,
-	addresses []PeerAddress, initial bool, newNode bool) *Peer {
+	addresses []PeerAddress, initial bool, newNode bool) Peer {
 	checkLaunchRequest(config, addresses, initial, newNode)
 	plog.Infof("%s created, initial: %t, new: %t",
 		dn(config.ClusterID, config.NodeID), initial, newNode)
-	r := newRaft(config, logdb)
-	p := &Peer{raft: r}
+	p := Peer{raft: newRaft(config, logdb)}
 	p.raft.events = events
-	_, lastIndex := logdb.GetRange()
-	if newNode && !config.IsObserver && !config.IsWitness {
-		r.becomeFollower(1, NoLeader)
-	}
+	p.prevState = p.raft.raftState()
 	if initial && newNode {
-		bootstrap(r, addresses)
-	}
-	if lastIndex == 0 {
-		p.prevState = emptyState
-	} else {
-		p.prevState = r.raftState()
+		p.raft.becomeFollower(1, NoLeader)
+		bootstrap(p.raft, addresses)
 	}
 	return p
 }
 
 // Tick moves the logical clock forward by one tick.
-func (p *Peer) Tick() {
-	p.raft.Handle(pb.Message{
+func (p *Peer) Tick() error {
+	return p.raft.Handle(pb.Message{
 		Type:   pb.LocalTick,
 		Reject: false,
 	})
 }
 
 // QuiescedTick moves the logical clock forward by one tick in quiesced mode.
-func (p *Peer) QuiescedTick() {
-	p.raft.Handle(pb.Message{
+func (p *Peer) QuiescedTick() error {
+	return p.raft.Handle(pb.Message{
 		Type:   pb.LocalTick,
 		Reject: true,
 	})
@@ -103,8 +95,8 @@ func (p *Peer) QuiescedTick() {
 
 // RequestLeaderTransfer makes a request to transfer the leadership to the
 // specified target node.
-func (p *Peer) RequestLeaderTransfer(target uint64) {
-	p.raft.Handle(pb.Message{
+func (p *Peer) RequestLeaderTransfer(target uint64) error {
+	return p.raft.Handle(pb.Message{
 		Type: pb.LeaderTransfer,
 		To:   p.raft.nodeID,
 		Hint: target,
@@ -113,8 +105,8 @@ func (p *Peer) RequestLeaderTransfer(target uint64) {
 
 // ProposeEntries proposes specified entries in a batched mode using a single
 // MTPropose message.
-func (p *Peer) ProposeEntries(ents []pb.Entry) {
-	p.raft.Handle(pb.Message{
+func (p *Peer) ProposeEntries(ents []pb.Entry) error {
+	return p.raft.Handle(pb.Message{
 		Type:    pb.Propose,
 		From:    p.raft.nodeID,
 		Entries: ents,
@@ -122,24 +114,21 @@ func (p *Peer) ProposeEntries(ents []pb.Entry) {
 }
 
 // ProposeConfigChange proposes a raft membership change.
-func (p *Peer) ProposeConfigChange(configChange pb.ConfigChange, key uint64) {
-	data, err := configChange.Marshal()
-	if err != nil {
-		panic(err)
-	}
-	p.raft.Handle(pb.Message{
+func (p *Peer) ProposeConfigChange(cc pb.ConfigChange, key uint64) error {
+	data := pb.MustMarshal(&cc)
+	return p.raft.Handle(pb.Message{
 		Type:    pb.Propose,
 		Entries: []pb.Entry{{Type: pb.ConfigChangeEntry, Cmd: data, Key: key}},
 	})
 }
 
 // ApplyConfigChange applies a raft membership change to the local raft node.
-func (p *Peer) ApplyConfigChange(cc pb.ConfigChange) {
+func (p *Peer) ApplyConfigChange(cc pb.ConfigChange) error {
 	if cc.NodeID == NoLeader {
 		p.raft.clearPendingConfigChange()
-		return
+		return nil
 	}
-	p.raft.Handle(pb.Message{
+	return p.raft.Handle(pb.Message{
 		Type:     pb.ConfigChangeEvent,
 		Reject:   false,
 		Hint:     cc.NodeID,
@@ -148,24 +137,24 @@ func (p *Peer) ApplyConfigChange(cc pb.ConfigChange) {
 }
 
 // RejectConfigChange rejects the currently pending raft membership change.
-func (p *Peer) RejectConfigChange() {
-	p.raft.Handle(pb.Message{
+func (p *Peer) RejectConfigChange() error {
+	return p.raft.Handle(pb.Message{
 		Type:   pb.ConfigChangeEvent,
 		Reject: true,
 	})
 }
 
 // RestoreRemotes applies the remotes info obtained from the specified snapshot.
-func (p *Peer) RestoreRemotes(ss pb.Snapshot) {
-	p.raft.Handle(pb.Message{
+func (p *Peer) RestoreRemotes(ss pb.Snapshot) error {
+	return p.raft.Handle(pb.Message{
 		Type:     pb.SnapshotReceived,
 		Snapshot: ss,
 	})
 }
 
 // ReportUnreachableNode marks the specified node as not reachable.
-func (p *Peer) ReportUnreachableNode(nodeID uint64) {
-	p.raft.Handle(pb.Message{
+func (p *Peer) ReportUnreachableNode(nodeID uint64) error {
+	return p.raft.Handle(pb.Message{
 		Type: pb.Unreachable,
 		From: nodeID,
 	})
@@ -173,8 +162,8 @@ func (p *Peer) ReportUnreachableNode(nodeID uint64) {
 
 // ReportSnapshotStatus reports the status of the snapshot to the local raft
 // node.
-func (p *Peer) ReportSnapshotStatus(nodeID uint64, reject bool) {
-	p.raft.Handle(pb.Message{
+func (p *Peer) ReportSnapshotStatus(nodeID uint64, reject bool) error {
+	return p.raft.Handle(pb.Message{
 		Type:   pb.SnapshotStatus,
 		From:   nodeID,
 		Reject: reject,
@@ -182,27 +171,30 @@ func (p *Peer) ReportSnapshotStatus(nodeID uint64, reject bool) {
 }
 
 // Handle processes the given message.
-func (p *Peer) Handle(m pb.Message) {
+func (p *Peer) Handle(m pb.Message) error {
 	if IsLocalMessageType(m.Type) {
 		panic("local message sent to Step")
 	}
-
 	_, rok := p.raft.remotes[m.From]
-	_, ook := p.raft.observers[m.From]
+	_, ook := p.raft.nonVotings[m.From]
 	_, wok := p.raft.witnesses[m.From]
-
 	if rok || ook || wok || !isResponseMessageType(m.Type) {
-		p.raft.Handle(m)
+		return p.raft.Handle(m)
 	}
+	return nil
 }
 
 // GetUpdate returns the current state of the Peer.
-func (p *Peer) GetUpdate(moreToApply bool, lastApplied uint64) pb.Update {
-	ud := p.getUpdate(moreToApply, lastApplied)
+func (p *Peer) GetUpdate(moreToApply bool,
+	lastApplied uint64) (pb.Update, error) {
+	ud, err := p.getUpdate(moreToApply, lastApplied)
+	if err != nil {
+		return pb.Update{}, err
+	}
 	validateUpdate(ud)
 	ud = setFastApply(ud)
 	ud.UpdateCommit = getUpdateCommit(ud)
-	return ud
+	return ud, nil
 }
 
 func setFastApply(ud pb.Update) pb.Update {
@@ -296,8 +288,8 @@ func (p *Peer) Commit(ud pb.Update) {
 
 // ReadIndex starts a ReadIndex operation. The ReadIndex protocol is defined in
 // the section 6.4 of the Raft thesis.
-func (p *Peer) ReadIndex(ctx pb.SystemCtx) {
-	p.raft.Handle(pb.Message{
+func (p *Peer) ReadIndex(ctx pb.SystemCtx) error {
+	return p.raft.Handle(pb.Message{
 		Type:     pb.ReadIndex,
 		Hint:     ctx.Low,
 		HintHigh: ctx.High,
@@ -320,7 +312,8 @@ func (p *Peer) entryLog() *entryLog {
 	return p.raft.log
 }
 
-func (p *Peer) getUpdate(moreToApply bool, lastApplied uint64) pb.Update {
+func (p *Peer) getUpdate(moreToApply bool,
+	lastApplied uint64) (pb.Update, error) {
 	ud := pb.Update{
 		ClusterID:     p.raft.clusterID,
 		NodeID:        p.raft.nodeID,
@@ -333,7 +326,11 @@ func (p *Peer) getUpdate(moreToApply bool, lastApplied uint64) pb.Update {
 		ud.Messages[idx].ClusterId = p.raft.clusterID
 	}
 	if moreToApply {
-		ud.CommittedEntries = p.entryLog().entriesToApply()
+		toApply, err := p.entryLog().entriesToApply()
+		if err != nil {
+			return pb.Update{}, err
+		}
+		ud.CommittedEntries = toApply
 	}
 	if len(ud.CommittedEntries) > 0 {
 		lastIndex := ud.CommittedEntries[len(ud.CommittedEntries)-1].Index
@@ -354,7 +351,7 @@ func (p *Peer) getUpdate(moreToApply bool, lastApplied uint64) pb.Update {
 	if len(p.raft.droppedReadIndexes) > 0 {
 		ud.DroppedReadIndexes = p.raft.droppedReadIndexes
 	}
-	return ud
+	return ud, nil
 }
 
 func checkLaunchRequest(config config.Config,
@@ -372,6 +369,12 @@ func checkLaunchRequest(config config.Config,
 	if len(uniqueAddressList) != len(addresses) {
 		plog.Panicf("duplicated address found %v", addresses)
 	}
+	if initial && config.IsWitness {
+		plog.Panicf("witness can not be used as initial member")
+	}
+	if initial && config.IsNonVoting {
+		plog.Panicf("non-voting can not be used as initial member")
+	}
 }
 
 func bootstrap(r *raft, addresses []PeerAddress) {
@@ -388,15 +391,11 @@ func bootstrap(r *raft, addresses []PeerAddress) {
 			Initialize: true,
 			Address:    peer.Address,
 		}
-		data, err := cc.Marshal()
-		if err != nil {
-			panic("unexpected marshal error")
-		}
 		ents[i] = pb.Entry{
 			Type:  pb.ConfigChangeEntry,
 			Term:  1,
 			Index: uint64(i + 1),
-			Cmd:   data,
+			Cmd:   pb.MustMarshal(&cc),
 		}
 	}
 	r.log.append(ents)

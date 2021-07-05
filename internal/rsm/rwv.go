@@ -34,11 +34,13 @@ package rsm
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"hash"
 	"io"
 	"math"
 
+	"github.com/cockroachdb/errors"
+
+	"github.com/lni/dragonboat/v3/internal/fileutil"
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/vfs"
 	pb "github.com/lni/dragonboat/v3/raftpb"
@@ -75,10 +77,7 @@ func validateBlock(block []byte, h hash.Hash) bool {
 	payload := block[:uint64(len(block))-checksumSize]
 	crc := block[uint64(len(block))-checksumSize:]
 	h.Reset()
-	_, err := h.Write(payload)
-	if err != nil {
-		panic(err)
-	}
+	fileutil.MustWrite(h, payload)
 	return bytes.Equal(crc, h.Sum(nil))
 }
 
@@ -134,9 +133,7 @@ func (bw *BlockWriter) Write(bs []byte) (int, error) {
 			l = uint64(len(bs))
 		}
 		bw.block = append(bw.block, bs[:l]...)
-		if _, err := bw.h.Write(bs[:l]); err != nil {
-			panic(err)
-		}
+		fileutil.MustWrite(bw.h, bs[:l])
 		bw.written += l
 		if bw.written == bw.nextStop {
 			bw.total += uint64(len(bw.block)) + checksumSize
@@ -184,9 +181,7 @@ func (bw *BlockWriter) GetPayloadChecksum() []byte {
 
 func (bw *BlockWriter) processNewBlock(data []byte, crc []byte) error {
 	if len(crc) > 0 {
-		if _, err := bw.fh.Write(crc); err != nil {
-			panic(err)
-		}
+		fileutil.MustWrite(bw.fh, crc)
 	}
 	return bw.onNewBlock(data, crc)
 }
@@ -225,8 +220,7 @@ func (br *blockReader) Read(data []byte) (int, error) {
 	read := len(br.block)
 	copy(data, br.block)
 	for read < want {
-		_, err := br.readBlock()
-		if err != nil {
+		if _, err := br.readBlock(); err != nil {
 			return read, err
 		}
 		toRead := want - read
@@ -247,8 +241,7 @@ func (br *blockReader) readBlock() (int, error) {
 		return n, err
 	}
 	br.block = br.block[:n]
-	h := mustGetChecksum(br.t)
-	if !validateBlock(br.block, h) {
+	if !validateBlock(br.block, mustGetChecksum(br.t)) {
 		panic("corrupted block")
 	}
 	br.block = br.block[:uint64(len(br.block))-checksumSize]
@@ -515,9 +508,7 @@ func GetV2PayloadChecksum(fp string, fs vfs.IFS) (crc []byte, err error) {
 		return nil, err
 	}
 	defer func() {
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, f.Close())
 	}()
 	for _, offset := range offsets {
 		crc := make([]byte, checksumSize)
@@ -533,19 +524,13 @@ func GetV2PayloadChecksum(fp string, fs vfs.IFS) (crc []byte, err error) {
 }
 
 func getV2ChecksumType(fp string, fs vfs.IFS) (ct pb.ChecksumType, err error) {
-	reader, err := NewSnapshotReader(fp, fs)
+	reader, header, err := NewSnapshotReader(fp, fs)
 	if err != nil {
 		return 0, err
 	}
 	defer func() {
-		if cerr := reader.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, reader.Close())
 	}()
-	header, err := reader.GetHeader()
-	if err != nil {
-		return pb.ChecksumType(0), err
-	}
 	if header.Version != uint64(V2) {
 		return pb.ChecksumType(0), errors.New("not a v2 snapshot file")
 	}

@@ -20,7 +20,7 @@ OS := $(shell uname)
 # the location of this Makefile
 PKGROOT=$(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 # name of the package
-PKGNAME=github.com/lni/dragonboat/v3
+PKGNAME=$(shell go list)
 
 ifeq ($(DRAGONBOAT_LOGDB),rocksdb)
 LOGDB_TAG=dragonboat_rocksdb_test
@@ -135,6 +135,9 @@ benchmark-fsync:
 	$(GOTEST)	-run ^$$ -bench=BenchmarkFSyncLatency
 
 GOTEST=$(GO) $(TEST_OPTIONS)
+.PHONY: slow-test
+slow-test:
+	SLOW_TEST=1 $(GOTEST) $(PKGNAME)
 .PHONY: test-plugins
 test-plugins:
 	$(GOTEST) $(PKGNAME)/plugin
@@ -199,13 +202,14 @@ tools-checkdisk:
 ###############################################################################
 CHECKED_PKGS=$(shell go list ./...)
 CHECKED_DIRS=$(subst $(PKGNAME), ,$(subst $(PKGNAME)/, ,$(CHECKED_PKGS))) .
-EXTRA_LINTERS=-E misspell -E scopelint -E interfacer -E rowserrcheck \
-	-E depguard -E unconvert -E prealloc -E gofmt -E stylecheck
+EXTRA_LINTERS=-E misspell -E scopelint -E rowserrcheck -E depguard -E unconvert \
+	-E prealloc -E gofmt -E stylecheck
 .PHONY: static-check
 static-check:
 	@for p in $(CHECKED_PKGS); do \
 		go vet -tests=false $$p; \
 		golint $$p; \
+		errcheck -blank -ignoretests $$p; \
 	done;
 	@for p in $(CHECKED_DIRS); do \
 		ineffassign $$p; \

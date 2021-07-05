@@ -1,4 +1,4 @@
-// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other contributors.
+// Copyright 2017-2021 Lei Ni (nilei81@gmail.com) and other contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,14 +21,19 @@ import (
 	"crypto/md5"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/oserror"
+
+	"github.com/lni/dragonboat/v3/internal/utils"
 	"github.com/lni/dragonboat/v3/internal/vfs"
+	pb "github.com/lni/dragonboat/v3/raftpb"
 )
 
 const (
@@ -41,18 +46,20 @@ const (
 	deleteFilename       = "DELETED.dragonboat"
 )
 
-// Marshaler is the interface for types that can be Marshaled.
-type Marshaler interface {
-	Marshal() ([]byte, error)
-}
+var firstError = utils.FirstError
 
-// Unmarshaler is the interface for types that can be Unmarshaled.
-type Unmarshaler interface {
-	Unmarshal([]byte) error
+var ws = errors.WithStack
+
+// MustWrite writes the specified data to the input writer. It will panic if
+// there is any error.
+func MustWrite(w io.Writer, data []byte) {
+	if _, err := w.Write(data); err != nil {
+		panic(err)
+	}
 }
 
 // DirExist returns whether the specified filesystem entry exists.
-func DirExist(name string, fs vfs.IFS) (bool, error) {
+func DirExist(name string, fs vfs.IFS) (result bool, err error) {
 	if name == "." || name == "/" {
 		return true, nil
 	}
@@ -63,10 +70,12 @@ func DirExist(name string, fs vfs.IFS) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer f.Close()
+	defer func() {
+		err = firstError(err, ws(f.Close()))
+	}()
 	s, err := f.Stat()
 	if err != nil {
-		return false, err
+		return false, ws(err)
 	}
 	if !s.IsDir() {
 		panic("not a dir")
@@ -139,10 +148,12 @@ func SyncDir(dir string, fs vfs.IFS) (err error) {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		err = firstError(err, ws(f.Close()))
+	}()
 	fileInfo, err := f.Stat()
 	if err != nil {
-		return err
+		return ws(err)
 	}
 	if !fileInfo.IsDir() {
 		panic("not a dir")
@@ -152,91 +163,83 @@ func SyncDir(dir string, fs vfs.IFS) (err error) {
 		return err
 	}
 	defer func() {
-		if cerr := df.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, ws(df.Close()))
 	}()
-	return df.Sync()
+	return ws(df.Sync())
 }
 
 // MarkDirAsDeleted marks the specified directory as deleted.
-func MarkDirAsDeleted(dir string, msg Marshaler, fs vfs.IFS) error {
+func MarkDirAsDeleted(dir string, msg pb.Marshaler, fs vfs.IFS) error {
 	return CreateFlagFile(dir, deleteFilename, msg, fs)
 }
 
 // IsDirMarkedAsDeleted returns a boolean flag indicating whether the specified
 // directory has been marked as deleted.
 func IsDirMarkedAsDeleted(dir string, fs vfs.IFS) (bool, error) {
-	fp := fs.PathJoin(dir, deleteFilename)
-	return Exist(fp, fs)
+	return Exist(fs.PathJoin(dir, deleteFilename), fs)
 }
 
 func getHash(data []byte) []byte {
 	h := md5.New()
-	if _, err := h.Write(data); err != nil {
-		panic(err)
-	}
+	MustWrite(h, data)
 	s := h.Sum(nil)
 	return s[8:]
 }
 
 // CreateFlagFile creates a flag file in the specific location. The flag file
 // contains the marshaled data of the specified protobuf message.
+//
+// CreateFlagFile is not atomic meaning you can end up having a file at
+// fs.PathJoin(dir, filename) with partial or corrupted content when the machine
+// crashes in the middle of this function call. Special care must be taken to
+// handle such situation, see how CreateFlagFile is used by snapshot images as
+// an example.
 func CreateFlagFile(dir string,
-	filename string, msg Marshaler, fs vfs.IFS) (err error) {
+	filename string, msg pb.Marshaler, fs vfs.IFS) (err error) {
 	fp := fs.PathJoin(dir, filename)
 	f, err := fs.Create(fp)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if cerr := SyncDir(dir, fs); err == nil {
-			err = cerr
-		}
+		err = firstError(err, ws(f.Close()))
+		err = firstError(err, SyncDir(dir, fs))
 	}()
-	data, err := msg.Marshal()
-	if err != nil {
-		panic(err)
-	}
+	data := pb.MustMarshal(msg)
 	h := getHash(data)
 	n, err := f.Write(h)
 	if err != nil {
-		return err
+		return ws(err)
 	}
 	if n != len(h) {
-		return io.ErrShortWrite
+		return ws(io.ErrShortWrite)
 	}
 	n, err = f.Write(data)
 	if err != nil {
-		return err
+		return ws(err)
 	}
 	if n != len(data) {
-		return io.ErrShortWrite
+		return ws(io.ErrShortWrite)
 	}
-	return f.Sync()
+	return ws(f.Sync())
 }
 
 // GetFlagFileContent gets the content of the flag file found in the specified
 // location. The data of the flag file will be unmarshaled into the specified
 // protobuf message.
 func GetFlagFileContent(dir string,
-	filename string, msg Unmarshaler, fs vfs.IFS) (err error) {
+	filename string, msg pb.Unmarshaler, fs vfs.IFS) (err error) {
 	fp := fs.PathJoin(dir, filename)
 	f, err := fs.Open(vfs.Clean(fp))
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, ws(f.Close()))
 	}()
-	data, err := ioutil.ReadAll(f)
+	data, err := ReadAll(f)
 	if err != nil {
-		return err
+		return ws(err)
 	}
 	if len(data) < 8 {
 		panic("corrupted flag file")
@@ -247,7 +250,8 @@ func GetFlagFileContent(dir string,
 	if !bytes.Equal(h, expectedHash) {
 		panic("corrupted flag file content")
 	}
-	return msg.Unmarshal(buf)
+	pb.MustUnmarshal(msg, buf)
+	return nil
 }
 
 // HasFlagFile returns a boolean value indicating whether flag file can be
@@ -271,12 +275,14 @@ func RemoveFlagFile(dir string, filename string, fs vfs.IFS) error {
 
 // ExtractTarBz2 extracts files and directories from the specified tar.bz2 file
 // to the specified target directory.
-func ExtractTarBz2(bz2fn string, toDir string, fs vfs.IFS) error {
+func ExtractTarBz2(bz2fn string, toDir string, fs vfs.IFS) (err error) {
 	f, err := fs.Open(bz2fn)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		err = firstError(err, f.Close())
+	}()
 	ts := bzip2.NewReader(f)
 	tarReader := tar.NewReader(ts)
 	for {
@@ -301,9 +307,7 @@ func ExtractTarBz2(bz2fn string, toDir string, fs vfs.IFS) error {
 					return err
 				}
 				defer func() {
-					if err := nf.Close(); err != nil {
-						panic(err)
-					}
+					err = firstError(err, nf.Close())
 				}()
 				_, err = io.Copy(nf, tarReader)
 				return err
@@ -342,6 +346,13 @@ func nextRandom() string {
 	return strconv.Itoa(int(1e9 + r%1e9))[1:]
 }
 
+// TempFile and TempDir functions below are modified from golang's
+// TempFile and TempDir functions.
+//
+// Copyright 2010 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 // TempFile returns a temp file.
 func TempFile(dir,
 	pattern string, fs vfs.IFS) (f vfs.File, name string, err error) {
@@ -349,7 +360,7 @@ func TempFile(dir,
 		dir = vfs.TempDir()
 		if fs != vfs.DefaultFS {
 			if err := fs.MkdirAll(dir, defaultDirFileMode); err != nil {
-				panic(err)
+				return nil, "", err
 			}
 		}
 	}
@@ -370,6 +381,67 @@ func TempFile(dir,
 				randmu.Unlock()
 			}
 			continue
+		}
+		break
+	}
+	return
+}
+
+var errPatternHasSeparator = errors.New("pattern contains path separator")
+
+// prefixAndSuffix splits pattern by the last wildcard "*", if applicable,
+// returning prefix as the part before "*" and suffix as the part after "*".
+func prefixAndSuffix(pattern string) (prefix, suffix string, err error) {
+	if strings.ContainsRune(pattern, os.PathSeparator) {
+		err = errPatternHasSeparator
+		return
+	}
+	if pos := strings.LastIndex(pattern, "*"); pos != -1 {
+		prefix, suffix = pattern[:pos], pattern[pos+1:]
+	} else {
+		prefix = pattern
+	}
+	return
+}
+
+// TempDir creates a new temporary directory in the directory dir.
+// The directory name is generated by taking pattern and applying a
+// random string to the end. If pattern includes a "*", the random string
+// replaces the last "*". TempDir returns the name of the new directory.
+// If dir is the empty string, TempDir uses the
+// default directory for temporary files (see os.TempDir).
+// Multiple programs calling TempDir simultaneously
+// will not choose the same directory. It is the caller's responsibility
+// to remove the directory when no longer needed.
+func TempDir(dir, pattern string, fs vfs.IFS) (name string, err error) {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+
+	prefix, suffix, err := prefixAndSuffix(pattern)
+	if err != nil {
+		return
+	}
+
+	nconflict := 0
+	for i := 0; i < 10000; i++ {
+		try := fs.PathJoin(dir, prefix+nextRandom()+suffix)
+		err = fs.MkdirAll(try, 0700)
+		if oserror.IsExist(err) {
+			if nconflict++; nconflict > 10 {
+				randmu.Lock()
+				rand = reseed()
+				randmu.Unlock()
+			}
+			continue
+		}
+		if oserror.IsNotExist(err) {
+			if _, err := fs.Stat(dir); oserror.IsNotExist(err) {
+				return "", err
+			}
+		}
+		if err == nil {
+			name = try
 		}
 		break
 	}

@@ -1,4 +1,4 @@
-// Copyright 2017-2020 Lei Ni (nilei81@gmail.com) and other contributors.
+// Copyright 2017-2021 Lei Ni (nilei81@gmail.com) and other contributors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 package raft
 
 import (
-	"errors"
+	"github.com/cockroachdb/errors"
 
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
@@ -105,13 +105,12 @@ func (l *entryLog) firstIndex() uint64 {
 }
 
 func (l *entryLog) lastIndex() uint64 {
-	index, ok := l.inmem.getLastIndex()
-	if ok {
+	if index, ok := l.inmem.getLastIndex(); ok {
 		return index
 	}
-
-	_, index = l.logdb.GetRange()
+	_, index := l.logdb.GetRange()
 	return index
+
 }
 
 func (l *entryLog) termEntryRange() (uint64, uint64) {
@@ -132,12 +131,12 @@ func (l *entryLog) entryRange() (uint64, uint64, bool) {
 	return l.firstIndex(), l.lastIndex(), true
 }
 
-func (l *entryLog) lastTerm() uint64 {
+func (l *entryLog) lastTerm() (uint64, error) {
 	t, err := l.term(l.lastIndex())
 	if err != nil {
-		panic(err)
+		return 0, err
 	}
-	return t
+	return t, nil
 }
 
 func (l *entryLog) term(index uint64) (uint64, error) {
@@ -148,15 +147,11 @@ func (l *entryLog) term(index uint64) (uint64, error) {
 	if t, ok := l.inmem.getTerm(index); ok {
 		return t, nil
 	}
-
 	t, err := l.logdb.Term(index)
-	if err != nil && err != ErrCompacted && err != ErrUnavailable {
-		panic(err)
+	if err != nil {
+		return 0, err
 	}
-	if err == nil {
-		return t, nil
-	}
-	return 0, err
+	return t, nil
 }
 
 func (l *entryLog) checkBound(low uint64, high uint64) error {
@@ -190,10 +185,8 @@ func (l *entryLog) getEntriesFromLogDB(low uint64,
 
 	upperBound := min(high, l.inmem.markerIndex)
 	ents, err := l.logdb.Entries(low, upperBound, maxSize)
-	if err == ErrCompacted {
+	if err != nil {
 		return nil, false, err
-	} else if err != nil {
-		panic(err)
 	}
 	if uint64(len(ents)) > upperBound-low {
 		plog.Panicf("uint64(len(ents)) > upperBound-low")
@@ -244,6 +237,7 @@ func (l *entryLog) entries(start uint64, maxSize uint64) ([]pb.Entry, error) {
 	return l.getEntries(start, l.lastIndex()+1, maxSize)
 }
 
+// TODO: double check whether the inmem.snapshot can be used in upper layer
 func (l *entryLog) snapshot() pb.Snapshot {
 	if l.inmem.snapshot != nil {
 		return *l.inmem.snapshot
@@ -267,37 +261,40 @@ func (l *entryLog) hasMoreEntriesToApply(appliedTo uint64) bool {
 	return l.committed > appliedTo
 }
 
-func (l *entryLog) entriesToApply() []pb.Entry {
+func (l *entryLog) entriesToApply() ([]pb.Entry, error) {
 	return l.getEntriesToApply(maxEntriesToApplySize)
 }
 
-func (l *entryLog) getEntriesToApply(limit uint64) []pb.Entry {
+func (l *entryLog) getEntriesToApply(limit uint64) ([]pb.Entry, error) {
 	if l.hasEntriesToApply() {
-		if ents, err := l.getEntries(l.firstNotAppliedIndex(),
-			l.toApplyIndexLimit(), limit); err != nil {
-			panic(err)
-		} else {
-			return ents
+		ents, err := l.getEntries(l.firstNotAppliedIndex(),
+			l.toApplyIndexLimit(), limit)
+		if err != nil {
+			return nil, err
 		}
+		return ents, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func (l *entryLog) entriesToSave() []pb.Entry {
 	return l.inmem.entriesToSave()
 }
 
-func (l *entryLog) tryAppend(index uint64, ents []pb.Entry) bool {
-	conflictIndex := l.getConflictIndex(ents)
+func (l *entryLog) tryAppend(index uint64, ents []pb.Entry) (bool, error) {
+	conflictIndex, err := l.getConflictIndex(ents)
+	if err != nil {
+		return false, err
+	}
 	if conflictIndex != 0 {
 		if conflictIndex <= l.committed {
 			plog.Panicf("entry %d conflicts with committed entry, committed %d",
 				conflictIndex, l.committed)
 		}
 		l.append(ents[conflictIndex-index-1:])
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 func (l *entryLog) append(entries []pb.Entry) {
@@ -311,13 +308,17 @@ func (l *entryLog) append(entries []pb.Entry) {
 	l.inmem.merge(entries)
 }
 
-func (l *entryLog) getConflictIndex(entries []pb.Entry) uint64 {
+func (l *entryLog) getConflictIndex(entries []pb.Entry) (uint64, error) {
 	for _, e := range entries {
-		if !l.matchTerm(e.Index, e.Term) {
-			return e.Index
+		match, err := l.matchTerm(e.Index, e.Term)
+		if err != nil {
+			return 0, err
+		}
+		if !match {
+			return e.Index, nil
 		}
 	}
-	return 0
+	return 0, nil
 }
 
 func (l *entryLog) commitTo(index uint64) {
@@ -327,6 +328,10 @@ func (l *entryLog) commitTo(index uint64) {
 	if index > l.lastIndex() {
 		plog.Panicf("invalid commitTo index %d, lastIndex() %d",
 			index, l.lastIndex())
+	}
+	if index < l.committed {
+		plog.Panicf("committed value moving backwards index %d, committed %d",
+			index, l.committed)
 	}
 	l.committed = index
 }
@@ -353,47 +358,51 @@ func (l *entryLog) commitUpdate(cu pb.UpdateCommit) {
 	}
 }
 
-func (l *entryLog) matchTerm(index uint64, term uint64) bool {
+func (l *entryLog) matchTerm(index uint64, term uint64) (bool, error) {
 	lt, err := l.term(index)
 	if err != nil {
-		return false
+		return false, err
 	}
-	return lt == term
+	return lt == term, nil
 }
 
-func (l *entryLog) upToDate(index uint64, term uint64) bool {
+func (l *entryLog) upToDate(index uint64, term uint64) (bool, error) {
 	lastTerm, err := l.term(l.lastIndex())
 	if err != nil {
-		plog.Panicf("failed to get the last term, %v", err)
+		return false, err
 	}
 	if term >= lastTerm {
 		if term > lastTerm {
-			return true
+			return true, nil
 		}
-		return index >= l.lastIndex()
+		return index >= l.lastIndex(), nil
 	}
-	return false
+	return false, nil
 }
 
-func (l *entryLog) tryCommit(index uint64, term uint64) bool {
+func (l *entryLog) tryCommit(index uint64, term uint64) (bool, error) {
 	if index <= l.committed {
-		return false
+		return false, nil
 	}
 	lterm, err := l.term(index)
-	if err == ErrCompacted {
+	if errors.Is(err, ErrCompacted) {
 		lterm = 0
 	} else if err != nil {
-		panic(err)
+		return false, err
 	}
 	if index > l.committed && lterm == term {
 		l.commitTo(index)
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 func (l *entryLog) restore(s pb.Snapshot) {
 	l.inmem.restore(s)
+	if s.Index < l.committed {
+		plog.Panicf("committed value moving backwards ss index %d, committed %d",
+			s.Index, l.committed)
+	}
 	l.committed = s.Index
 	l.processed = s.Index
 }

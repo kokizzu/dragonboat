@@ -22,16 +22,17 @@ package rsm
 
 import (
 	"bytes"
-	"errors"
 	"sync"
 	"sync/atomic"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/logutil"
 
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/raft"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/utils"
 	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/logger"
 	pb "github.com/lni/dragonboat/v3/raftpb"
@@ -67,7 +68,10 @@ const (
 // SSEnv is the snapshot environment type.
 type SSEnv = server.SSEnv
 
-// SSRequest is the type for describing the details of a snapshot request.
+// DefaultSSRequest is the default SSRequest.
+var DefaultSSRequest = SSRequest{}
+
+// SSRequest contains details of a snapshot request.
 type SSRequest struct {
 	Path               string
 	Type               SSReqType
@@ -137,9 +141,9 @@ type SMFactoryFunc func(clusterID uint64,
 // INode is the interface of a dragonboat node.
 type INode interface {
 	StepReady()
-	RestoreRemotes(pb.Snapshot)
+	RestoreRemotes(pb.Snapshot) error
 	ApplyUpdate(pb.Entry, sm.Result, bool, bool, bool)
-	ApplyConfigChange(pb.ConfigChange, uint64, bool)
+	ApplyConfigChange(pb.ConfigChange, uint64, bool) error
 	NodeID() uint64
 	ClusterID() uint64
 	ShouldStop() <-chan struct{}
@@ -147,8 +151,7 @@ type INode interface {
 
 // ISnapshotter is the interface for the snapshotter object.
 type ISnapshotter interface {
-	GetSnapshot(uint64) (pb.Snapshot, error)
-	GetMostRecentSnapshot() (pb.Snapshot, error)
+	GetSnapshot() (pb.Snapshot, error)
 	Stream(IStreamable, SSMeta, pb.IChunkSink) error
 	Shrunk(ss pb.Snapshot) (bool, error)
 	Save(ISavable, SSMeta) (pb.Snapshot, SSEnv, error)
@@ -165,7 +168,7 @@ type StateMachine struct {
 	snapshotter ISnapshotter
 	taskQ       *TaskQueue
 	sessions    *SessionManager
-	members     *membership
+	members     membership
 	// lastApplied is the last applied index visibile to other modules in the
 	// system. it is updated by only setting the last index and term values of
 	// the update batch. it is protected by its own mutex to minimize contention
@@ -188,6 +191,8 @@ type StateMachine struct {
 	aborted         bool
 	isWitness       bool
 }
+
+var firstError = utils.FirstError
 
 // NewStateMachine creates a new application state machine object.
 func NewStateMachine(sm IManagedStateMachine,
@@ -226,8 +231,8 @@ func (s *StateMachine) TaskChanBusy() bool {
 }
 
 // Close closes the state machine.
-func (s *StateMachine) Close() {
-	s.sm.Close()
+func (s *StateMachine) Close() error {
+	return s.sm.Close()
 }
 
 // DestroyedC return a chan struct{} used to indicate whether the SM has been
@@ -237,38 +242,40 @@ func (s *StateMachine) DestroyedC() <-chan struct{} {
 }
 
 // Recover applies the snapshot.
-func (s *StateMachine) Recover(t Task) (uint64, error) {
+func (s *StateMachine) Recover(t Task) (_ pb.Snapshot, err error) {
 	ss, err := s.getSnapshot(t)
 	if err != nil {
-		return 0, err
+		return pb.Snapshot{}, err
 	}
 	if pb.IsEmptySnapshot(ss) {
-		return 0, nil
+		return pb.Snapshot{}, nil
 	}
 	plog.Debugf("%s called Recover, %s, on disk idx %d",
 		s.id(), s.ssid(ss.Index), ss.OnDiskIndex)
 	if err := s.recover(ss, t.Initial); err != nil {
-		return 0, err
+		return pb.Snapshot{}, err
 	}
-	s.node.RestoreRemotes(ss)
+	if err := s.node.RestoreRemotes(ss); err != nil {
+		return pb.Snapshot{}, err
+	}
 	plog.Debugf("%s restored %s", s.id(), s.ssid(ss.Index))
-	return ss.Index, nil
+	return ss, nil
 }
 
 func (s *StateMachine) getSnapshot(t Task) (pb.Snapshot, error) {
+	ss, err := s.snapshotter.GetSnapshot()
 	if !t.Initial {
-		ss, err := s.snapshotter.GetSnapshot(t.Index)
 		if err != nil && !s.snapshotter.IsNoSnapshotError(err) {
-			plog.Errorf("%s, get snapshot failed: %v", s.id(), err)
 			return pb.Snapshot{}, ErrRestoreSnapshot
 		}
 		if s.snapshotter.IsNoSnapshotError(err) {
-			plog.Errorf("%s, no snapshot", s.id())
 			return pb.Snapshot{}, err
+		}
+		if ss.Index < t.Index {
+			plog.Panicf("%s out of date snapshot, %d, %d", s.id(), ss.Index, t.Index)
 		}
 		return ss, nil
 	}
-	ss, err := s.snapshotter.GetMostRecentSnapshot()
 	if s.snapshotter.IsNoSnapshotError(err) {
 		plog.Infof("%s no snapshot available during launch", s.id())
 		return pb.Snapshot{}, nil
@@ -282,19 +289,37 @@ func (s *StateMachine) mustBeOnDiskSM() {
 	}
 }
 
-func (s *StateMachine) recoverRequired(ss pb.Snapshot, init bool) bool {
-	s.mustBeOnDiskSM()
+// isShrunkSnapshot determines if the snapshot is shrunk. This check involves
+// disk I/O
+func (s *StateMachine) isShrunkSnapshot(ss pb.Snapshot, init bool) (bool, error) {
+	if !s.OnDiskStateMachine() {
+		return false, nil
+	}
+	if ss.Witness || ss.Dummy {
+		return false, nil
+	}
 	shrunk, err := s.snapshotter.Shrunk(ss)
 	if err != nil {
-		panic(err)
+		return false, err
 	}
 	if !init && shrunk {
 		panic("not initial recovery but snapshot shrunk")
 	}
+	return shrunk, nil
+}
+
+// recoverRequired determines if the snapshot must be recovered or not. This method
+// mustn't be called on a non-disk-sm or on a partial snapshot (shrunk, witness or dummy).
+// The check that this method is not called on a shrunk snapshot is not enforced, because
+// this would involve a disk I/O. The caller is responsible for not calling this method
+// on a shrunk snapshot and can optimize for only determining once if it has been shrunk
+// or not.
+func (s *StateMachine) recoverRequired(ss pb.Snapshot, init bool) bool {
+	s.mustBeOnDiskSM()
+	if ss.Witness || ss.Dummy {
+		panic("called on a partial snapshot")
+	}
 	if init {
-		if shrunk {
-			return false
-		}
 		if ss.Imported {
 			return true
 		}
@@ -318,7 +343,30 @@ func (s *StateMachine) checkRecoverOnDiskSM(ss pb.Snapshot, init bool) {
 	}
 }
 
+func (s *StateMachine) checkPartialSnapshotApplyOnDiskSM(ss pb.Snapshot, init bool) {
+	s.mustBeOnDiskSM()
+	// For OnDisk StateMachines check for corruption: A partial snapshot can only be
+	// applied if we have at least the OnDiskIndex of the snapshot reached.
+	if init {
+		if ss.OnDiskIndex > s.onDiskInitIndex {
+			plog.Panicf("%s, ss.OnDiskIndex (%d) > s.onDiskInitIndex (%d)",
+				s.id(), ss.OnDiskIndex, s.onDiskInitIndex)
+		}
+	} else if ss.OnDiskIndex > s.onDiskIndex {
+		plog.Panicf("%s, ss.OnDiskInit (%d) > s.onDiskIndex (%d)",
+			s.id(), ss.OnDiskIndex, s.onDiskIndex)
+	}
+}
+
 func (s *StateMachine) recover(ss pb.Snapshot, init bool) error {
+	if err := s.doRecover(ss, init); err != nil {
+		return err
+	}
+	s.apply(ss, init)
+	return nil
+}
+
+func (s *StateMachine) doRecover(ss pb.Snapshot, init bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.GetLastApplied() >= ss.Index {
@@ -327,43 +375,50 @@ func (s *StateMachine) recover(ss pb.Snapshot, init bool) error {
 	if s.aborted {
 		return sm.ErrSnapshotStopped
 	}
-	if ss.Witness || ss.Dummy {
-		s.apply(ss)
+	onDisk := s.OnDiskStateMachine()
+	shrunk, err := s.isShrunkSnapshot(ss, init)
+	if err != nil {
+		return err
+	}
+	if ss.Witness || ss.Dummy || shrunk {
+		if onDisk {
+			s.checkPartialSnapshotApplyOnDiskSM(ss, init)
+		}
 		return nil
 	}
-	if !s.OnDiskStateMachine() {
-		return s.doRecover(ss, init)
+	if !onDisk {
+		if err := s.load(ss, init); err != nil {
+			return err
+		}
+		return nil
 	}
 	if s.recoverRequired(ss, init) {
 		s.checkRecoverOnDiskSM(ss, init)
-		if err := s.doRecover(ss, init); err != nil {
+		if err := s.load(ss, init); err != nil {
 			return err
 		}
 		s.applyOnDisk(ss, init)
-	} else {
-		s.apply(ss)
 	}
 	return nil
 }
 
-func (s *StateMachine) doRecover(ss pb.Snapshot, init bool) error {
-	index := ss.Index
-	plog.Debugf("%s recovering from %s, init %t", s.id(), s.ssid(index), init)
-	s.logMembership("members", index, ss.Membership.Addresses)
-	s.logMembership("observers", index, ss.Membership.Observers)
-	s.logMembership("witnesses", index, ss.Membership.Witnesses)
+func (s *StateMachine) load(ss pb.Snapshot, init bool) error {
 	if err := s.snapshotter.Load(ss, s.sessions, s.sm); err != nil {
-		plog.Errorf("%s failed to load %s, %v", s.id(), s.ssid(index), err)
+		plog.Errorf("%s failed to load %s, %v", s.id(), s.ssid(ss.Index), err)
 		if err == sm.ErrSnapshotStopped {
 			s.aborted = true
 		}
 		return err
 	}
-	s.apply(ss)
 	return nil
 }
 
-func (s *StateMachine) apply(ss pb.Snapshot) {
+func (s *StateMachine) apply(ss pb.Snapshot, init bool) {
+	index := ss.Index
+	plog.Debugf("%s recovering from %s, init %t", s.id(), s.ssid(index), init)
+	s.logMembership("members", index, ss.Membership.Addresses)
+	s.logMembership("nonVotings", index, ss.Membership.NonVotings)
+	s.logMembership("witnesses", index, ss.Membership.Witnesses)
 	s.members.set(ss.Membership)
 	s.lastApplied.Lock()
 	defer s.lastApplied.Unlock()
@@ -377,7 +432,6 @@ func (s *StateMachine) applyOnDisk(ss pb.Snapshot, init bool) {
 	if ss.Imported && init {
 		s.onDiskInitIndex = ss.OnDiskIndex
 	}
-	s.apply(ss)
 }
 
 //TODO: add test to cover the case when ReadyToStreamSnapshot returns false
@@ -491,7 +545,7 @@ func (s *StateMachine) Concurrent() bool {
 // OnDiskStateMachine returns a boolean flag indicating whether it is an on
 // disk state machine.
 func (s *StateMachine) OnDiskStateMachine() bool {
-	return s.onDiskSM && !s.isWitness
+	return s.onDiskSM
 }
 
 // Save creates a snapshot.
@@ -704,6 +758,10 @@ func (s *StateMachine) setLastApplied(entries []pb.Entry) {
 	}
 }
 
+func (s *StateMachine) savingDummySnapshot(r SSRequest) bool {
+	return s.OnDiskStateMachine() && !r.Streaming() && !r.Exported()
+}
+
 func (s *StateMachine) checkSnapshotStatus(r SSRequest) error {
 	if s.aborted {
 		return sm.ErrSnapshotStopped
@@ -768,7 +826,7 @@ func (s *StateMachine) prepare(r SSRequest) (SSMeta, error) {
 	}
 	var err error
 	var ctx interface{}
-	if s.Concurrent() {
+	if s.Concurrent() && !s.savingDummySnapshot(r) {
 		ctx, err = s.sm.Prepare()
 		if err != nil {
 			return SSMeta{}, err
@@ -821,21 +879,27 @@ func (s *StateMachine) handle(t []Task, a []sm.Entry) error {
 		if t[idx].IsSnapshotTask() || t[idx].isSyncTask() {
 			plog.Panicf("%s trying to handle a snapshot/sync request", s.id())
 		}
-		e := t[idx].Entries
-		update, noop := getEntryTypes(e)
+		// TODO: add a test for this
+		var entries []pb.Entry
+		func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			entries = pb.EntriesToApply(t[idx].Entries, s.index, false)
+		}()
+		update, noop := getEntryTypes(entries)
 		if batch && update && noop {
-			if err := s.handleBatch(e, a); err != nil {
+			if err := s.handleBatch(entries, a); err != nil {
 				return err
 			}
 		} else {
-			for i := range e {
-				last := idx == len(t)-1 && i == len(e)-1
-				if err := s.handleEntry(e[i], last); err != nil {
+			for i := range entries {
+				last := idx == len(t)-1 && i == len(entries)-1
+				if err := s.handleEntry(entries[i], last); err != nil {
 					return err
 				}
 			}
 		}
-		s.setLastApplied(e)
+		s.setLastApplied(entries)
 	}
 	return nil
 }
@@ -869,35 +933,34 @@ func (s *StateMachine) setOnDiskIndex(first uint64, last uint64) {
 
 func (s *StateMachine) handleEntry(e pb.Entry, last bool) error {
 	if e.IsConfigChange() {
-		s.configChange(e)
-	} else {
-		if !e.IsSessionManaged() {
-			if e.IsEmpty() {
-				s.noop(e)
-				s.node.ApplyUpdate(e, sm.Result{}, false, true, last)
-			} else {
-				panic("not session managed, not empty")
-			}
+		return s.configChange(e)
+	}
+	if !e.IsSessionManaged() {
+		if e.IsEmpty() {
+			s.noop(e)
+			s.node.ApplyUpdate(e, sm.Result{}, false, true, last)
 		} else {
-			if e.IsNewSessionRequest() {
-				r := s.registerSession(e)
-				s.node.ApplyUpdate(e, r, isEmptyResult(r), false, last)
-			} else if e.IsEndOfSessionRequest() {
-				r := s.unregisterSession(e)
-				s.node.ApplyUpdate(e, r, isEmptyResult(r), false, last)
-			} else {
-				if !s.entryInInitDiskSM(e.Index) {
-					r, ignored, rejected, err := s.update(e)
-					if err != nil {
-						return err
-					}
-					if !ignored {
-						s.node.ApplyUpdate(e, r, rejected, ignored, last)
-					}
-				} else {
-					// treat it as a NoOP entry
-					s.noop(pb.Entry{Index: e.Index, Term: e.Term})
+			panic("not session managed, not empty")
+		}
+	} else {
+		if e.IsNewSessionRequest() {
+			r := s.registerSession(e)
+			s.node.ApplyUpdate(e, r, isEmptyResult(r), false, last)
+		} else if e.IsEndOfSessionRequest() {
+			r := s.unregisterSession(e)
+			s.node.ApplyUpdate(e, r, isEmptyResult(r), false, last)
+		} else {
+			if !s.entryInInitDiskSM(e.Index) {
+				r, ignored, rejected, err := s.update(e)
+				if err != nil {
+					return err
 				}
+				if !ignored {
+					s.node.ApplyUpdate(e, r, rejected, ignored, last)
+				}
+			} else {
+				// treat it as a NoOP entry
+				s.noop(pb.Entry{Index: e.Index, Term: e.Term})
 			}
 		}
 	}
@@ -920,10 +983,11 @@ func (s *StateMachine) handleBatch(input []pb.Entry, ents []sm.Entry) error {
 	skipped := 0
 	for _, e := range input {
 		if !s.entryInInitDiskSM(e.Index) {
-			ents = append(ents, sm.Entry{
-				Index: e.Index,
-				Cmd:   GetPayload(e),
-			})
+			payload, err := GetPayload(e)
+			if err != nil {
+				return err
+			}
+			ents = append(ents, sm.Entry{Index: e.Index, Cmd: payload})
 		} else {
 			skipped++
 			s.setApplied(e.Index, e.Term)
@@ -950,11 +1014,9 @@ func (s *StateMachine) handleBatch(input []pb.Entry, ents []sm.Entry) error {
 	return nil
 }
 
-func (s *StateMachine) configChange(e pb.Entry) {
+func (s *StateMachine) configChange(e pb.Entry) error {
 	var cc pb.ConfigChange
-	if err := cc.Unmarshal(e.Cmd); err != nil {
-		panic(err)
-	}
+	pb.MustUnmarshal(&cc, e.Cmd)
 	rejected := true
 	func() {
 		s.mu.Lock()
@@ -964,7 +1026,7 @@ func (s *StateMachine) configChange(e pb.Entry) {
 			rejected = false
 		}
 	}()
-	s.node.ApplyConfigChange(cc, e.Key, rejected)
+	return s.node.ApplyConfigChange(cc, e.Key, rejected)
 }
 
 func (s *StateMachine) registerSession(e pb.Entry) sm.Result {
@@ -1024,7 +1086,11 @@ func (s *StateMachine) update(e pb.Entry) (sm.Result, bool, bool, error) {
 			panic("already has response in session")
 		}
 	}
-	r, err := s.sm.Update(sm.Entry{Index: e.Index, Cmd: GetPayload(e)})
+	payload, err := GetPayload(e)
+	if err != nil {
+		return sm.Result{}, false, false, err
+	}
+	r, err := s.sm.Update(sm.Entry{Index: e.Index, Cmd: payload})
 	if err != nil {
 		return sm.Result{}, false, false, err
 	}

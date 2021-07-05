@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/leaktest"
 
 	"github.com/lni/dragonboat/v3/client"
@@ -66,8 +67,8 @@ type testNodeProxy struct {
 	applyUpdateInvoked bool
 	notifyReadClient   bool
 	addPeerCount       uint64
-	addObserver        bool
-	addObserverCount   uint64
+	addNonVoting       bool
+	addNonVotingCount  uint64
 	nodeReady          uint64
 	applyUpdateCalled  bool
 	firstIndex         uint64
@@ -99,28 +100,30 @@ func (p *testNodeProxy) ApplyUpdate(entry pb.Entry,
 
 func (p *testNodeProxy) SetLastApplied(v uint64) {}
 
-func (p *testNodeProxy) RestoreRemotes(s pb.Snapshot) {
+func (p *testNodeProxy) RestoreRemotes(s pb.Snapshot) error {
 	for k := range s.Membership.Addresses {
 		_ = k
 		p.addPeer = true
 		p.addPeerCount++
 	}
+	return nil
 }
 
-func (p *testNodeProxy) ApplyConfigChange(cc pb.ConfigChange, key uint64, rejected bool) {
+func (p *testNodeProxy) ApplyConfigChange(cc pb.ConfigChange, key uint64, rejected bool) error {
 	if !rejected {
 		p.applyConfChange = true
 		if cc.Type == pb.AddNode {
 			p.addPeer = true
 			p.addPeerCount++
-		} else if cc.Type == pb.AddObserver {
-			p.addObserver = true
-			p.addObserverCount++
+		} else if cc.Type == pb.AddNonVoting {
+			p.addNonVoting = true
+			p.addNonVotingCount++
 		} else if cc.Type == pb.RemoveNode {
 			p.removePeer = true
 		}
 	}
 	p.configChangeProcessed(key, rejected)
+	return nil
 }
 
 func (p *testNodeProxy) configChangeProcessed(index uint64, rejected bool) {
@@ -134,6 +137,12 @@ func (p *testNodeProxy) configChangeProcessed(index uint64, rejected bool) {
 func (p *testNodeProxy) NodeID() uint64    { return 1 }
 func (p *testNodeProxy) ClusterID() uint64 { return 1 }
 
+type noopCompactor struct{}
+
+func (noopCompactor) Compact(uint64) error { return nil }
+
+var testCompactor = &noopCompactor{}
+
 type testSnapshotter struct {
 	index    uint64
 	dataSize uint64
@@ -144,22 +153,23 @@ func newTestSnapshotter(fs vfs.IFS) *testSnapshotter {
 	return &testSnapshotter{fs: fs}
 }
 
-func (s *testSnapshotter) GetSnapshot(index uint64) (pb.Snapshot, error) {
+func (s *testSnapshotter) GetSnapshot() (pb.Snapshot, error) {
 	fn := fmt.Sprintf("snapshot-test.%s", snapshotFileSuffix)
 	fp := s.fs.PathJoin(testSnapshotterDir, fn)
 	address := make(map[uint64]string)
 	address[1] = "localhost:1"
 	address[2] = "localhost:2"
-	snap := pb.Snapshot{
+	ss := pb.Snapshot{
 		Filepath: fp,
 		FileSize: s.dataSize,
-		Index:    index,
+		Index:    s.index,
 		Term:     2,
 		Membership: pb.Membership{
 			Addresses: address,
 		},
 	}
-	return snap, nil
+	ss.Load(testCompactor)
+	return ss, nil
 }
 
 func (s *testSnapshotter) Shrunk(ss pb.Snapshot) (bool, error) {
@@ -171,7 +181,7 @@ func (s *testSnapshotter) getFilePath(index uint64) string {
 	return s.fs.PathJoin(testSnapshotterDir, filename)
 }
 
-func (s *testSnapshotter) GetMostRecentSnapshot() (pb.Snapshot, error) {
+func (s *testSnapshotter) GetSnapshotFromLogDB() (pb.Snapshot, error) {
 	fn := fmt.Sprintf("snapshot-test.%s", snapshotFileSuffix)
 	fp := s.fs.PathJoin(testSnapshotterDir, fn)
 	snap := pb.Snapshot{
@@ -216,9 +226,7 @@ func (s *testSnapshotter) Save(savable ISavable,
 	}
 	cw := dio.NewCountedWriter(writer)
 	defer func() {
-		if cerr := cw.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, cw.Close())
 		if ss.Index > 0 {
 			ss.FileSize = cw.BytesWritten() + HeaderSize
 		}
@@ -247,17 +255,13 @@ func (s *testSnapshotter) Load(ss pb.Snapshot,
 			Metadata: f.Metadata,
 		})
 	}
-	reader, err := NewSnapshotReader(fp, s.fs)
+	reader, header, err := NewSnapshotReader(fp, s.fs)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		err = reader.Close()
 	}()
-	header, err := reader.GetHeader()
-	if err != nil {
-		return err
-	}
 	v := SSVersion(header.Version)
 	if err := loadable.LoadSessions(reader, v); err != nil {
 		return err
@@ -265,7 +269,6 @@ func (s *testSnapshotter) Load(ss pb.Snapshot,
 	if err := recoverable.Recover(reader, fs); err != nil {
 		return err
 	}
-	reader.ValidatePayload(header)
 	return nil
 }
 
@@ -602,12 +605,12 @@ func TestLookupNotAllowedOnClosedCluster(t *testing.T) {
 
 func TestGetMembership(t *testing.T) {
 	tf := func(t *testing.T, sm *StateMachine) {
-		sm.members.members = &pb.Membership{
+		sm.members.members = pb.Membership{
 			Addresses: map[uint64]string{
 				100: "a100",
 				234: "a234",
 			},
-			Observers: map[uint64]string{
+			NonVotings: map[uint64]string{
 				200: "a200",
 				300: "a300",
 			},
@@ -625,7 +628,7 @@ func TestGetMembership(t *testing.T) {
 		if m.ConfigChangeId != 12345 {
 			t.Errorf("unexpected cid value")
 		}
-		if len(m.Addresses) != 2 || len(m.Observers) != 2 ||
+		if len(m.Addresses) != 2 || len(m.NonVotings) != 2 ||
 			len(m.Removed) != 3 || len(m.Witnesses) != 1 {
 			t.Errorf("len changed")
 		}
@@ -636,12 +639,12 @@ func TestGetMembership(t *testing.T) {
 
 func TestGetMembershipNodes(t *testing.T) {
 	tf := func(t *testing.T, sm *StateMachine) {
-		sm.members.members = &pb.Membership{
+		sm.members.members = pb.Membership{
 			Addresses: map[uint64]string{
 				100: "a100",
 				234: "a234",
 			},
-			Observers: map[uint64]string{
+			NonVotings: map[uint64]string{
 				200: "a200",
 				300: "a300",
 			},
@@ -669,7 +672,7 @@ func TestGetMembershipNodes(t *testing.T) {
 
 func TestGetMembershipHash(t *testing.T) {
 	tf := func(t *testing.T, sm *StateMachine) {
-		sm.members.members = &pb.Membership{
+		sm.members.members = pb.Membership{
 			Addresses: map[uint64]string{
 				100: "a100",
 				234: "a234",
@@ -704,7 +707,7 @@ func TestGetSSMetaPanicWhenThereIsNoMember(t *testing.T) {
 
 func TestGetSSMeta(t *testing.T) {
 	tf := func(t *testing.T, sm *StateMachine) {
-		sm.members.members = &pb.Membership{
+		sm.members.members = pb.Membership{
 			Addresses: map[uint64]string{
 				100: "a100",
 				234: "a234",
@@ -768,7 +771,7 @@ func TestHandleConfChangeAddNode(t *testing.T) {
 	runSMTest2(t, tf, fs)
 }
 
-func TestAddNodeAsObserverWillBeRejected(t *testing.T) {
+func TestAddNodeAsNonVotingWillBeRejected(t *testing.T) {
 	tf := func(t *testing.T, sm *StateMachine, ds IManagedStateMachine,
 		nodeProxy *testNodeProxy, snapshotter *testSnapshotter, store sm.IStateMachine) {
 		applyConfigChangeEntry(sm,
@@ -786,7 +789,7 @@ func TestAddNodeAsObserverWillBeRejected(t *testing.T) {
 		}
 		applyConfigChangeEntry(sm,
 			123,
-			pb.AddObserver,
+			pb.AddNonVoting,
 			4,
 			"localhost:1010",
 			124)
@@ -801,12 +804,12 @@ func TestAddNodeAsObserverWillBeRejected(t *testing.T) {
 	runSMTest2(t, tf, fs)
 }
 
-func TestObserverCanBeAdded(t *testing.T) {
+func TestNonVotingCanBeAdded(t *testing.T) {
 	tf := func(t *testing.T, sm *StateMachine, ds IManagedStateMachine,
 		nodeProxy *testNodeProxy, snapshotter *testSnapshotter, store sm.IStateMachine) {
 		applyConfigChangeEntry(sm,
 			1,
-			pb.AddObserver,
+			pb.AddNonVoting,
 			4,
 			"localhost:1010",
 			123)
@@ -824,20 +827,20 @@ func TestObserverCanBeAdded(t *testing.T) {
 		if nodeProxy.addPeer {
 			t.Errorf("add peer unexpectedly called")
 		}
-		if !nodeProxy.addObserver {
-			t.Errorf("add observer not called")
+		if !nodeProxy.addNonVoting {
+			t.Errorf("add nonVoting not called")
 		}
 	}
 	fs := vfs.GetTestFS()
 	runSMTest2(t, tf, fs)
 }
 
-func TestObserverPromotion(t *testing.T) {
+func TestNonVotingPromotion(t *testing.T) {
 	tf := func(t *testing.T, sm *StateMachine, ds IManagedStateMachine,
 		nodeProxy *testNodeProxy, snapshotter *testSnapshotter, store sm.IStateMachine) {
 		applyConfigChangeEntry(sm,
 			1,
-			pb.AddObserver,
+			pb.AddNonVoting,
 			4,
 			"localhost:1010",
 			123)
@@ -855,8 +858,8 @@ func TestObserverPromotion(t *testing.T) {
 		if nodeProxy.addPeer {
 			t.Errorf("add peer unexpectedly called")
 		}
-		if !nodeProxy.addObserver {
-			t.Errorf("add observer not called")
+		if !nodeProxy.addNonVoting {
+			t.Errorf("add nonVoting not called")
 		}
 		applyConfigChangeEntry(sm,
 			123,
@@ -877,20 +880,20 @@ func TestObserverPromotion(t *testing.T) {
 		if len(sm.members.members.Addresses) != 1 {
 			t.Errorf("node count != 1")
 		}
-		if len(sm.members.members.Observers) != 0 {
-			t.Errorf("observer count != 0")
+		if len(sm.members.members.NonVotings) != 0 {
+			t.Errorf("nonVoting count != 0")
 		}
 	}
 	fs := vfs.GetTestFS()
 	runSMTest2(t, tf, fs)
 }
 
-func TestInvalidObserverPromotionIsRejected(t *testing.T) {
+func TestInvalidNonVotingPromotionIsRejected(t *testing.T) {
 	tf := func(t *testing.T, sm *StateMachine, ds IManagedStateMachine,
 		nodeProxy *testNodeProxy, snapshotter *testSnapshotter, store sm.IStateMachine) {
 		applyConfigChangeEntry(sm,
 			1,
-			pb.AddObserver,
+			pb.AddNonVoting,
 			4,
 			"localhost:1010",
 			123)
@@ -908,8 +911,8 @@ func TestInvalidObserverPromotionIsRejected(t *testing.T) {
 		if nodeProxy.addPeer {
 			t.Errorf("add peer unexpectedly called")
 		}
-		if !nodeProxy.addObserver {
-			t.Errorf("add observer not called")
+		if !nodeProxy.addNonVoting {
+			t.Errorf("add nonVoting not called")
 		}
 		nodeProxy.accept = false
 		applyConfigChangeEntry(sm,
@@ -924,7 +927,7 @@ func TestInvalidObserverPromotionIsRejected(t *testing.T) {
 		}
 		_, ok := sm.members.members.Addresses[4]
 		if ok {
-			t.Errorf("expectedly promoted observer")
+			t.Errorf("expectedly promoted nonVoting")
 		}
 		if nodeProxy.accept {
 			t.Errorf("unexpectedly accepted the promotion")
@@ -965,7 +968,7 @@ func testAddExistingMemberIsRejected(t *testing.T, tt pb.ConfigChangeType, fs vf
 func TestAddExistingMemberIsRejected(t *testing.T) {
 	fs := vfs.GetTestFS()
 	testAddExistingMemberIsRejected(t, pb.AddNode, fs)
-	testAddExistingMemberIsRejected(t, pb.AddObserver, fs)
+	testAddExistingMemberIsRejected(t, pb.AddNonVoting, fs)
 }
 
 func testAddExistingMemberWithSameNodeIDIsRejected(t *testing.T,
@@ -974,8 +977,8 @@ func testAddExistingMemberWithSameNodeIDIsRejected(t *testing.T,
 		nodeProxy *testNodeProxy, snapshotter *testSnapshotter, store sm.IStateMachine) {
 		if tt == pb.AddNode {
 			sm.members.members.Addresses[5] = "localhost:1010"
-		} else if tt == pb.AddObserver {
-			sm.members.members.Observers[5] = "localhost:1010"
+		} else if tt == pb.AddNonVoting {
+			sm.members.members.NonVotings[5] = "localhost:1010"
 		} else {
 			panic("unknown tt")
 		}
@@ -1006,7 +1009,7 @@ func testAddExistingMemberWithSameNodeIDIsRejected(t *testing.T,
 func TestAddExistingMemberWithSameNodeIDIsRejected(t *testing.T) {
 	fs := vfs.GetTestFS()
 	testAddExistingMemberWithSameNodeIDIsRejected(t, pb.AddNode, fs)
-	testAddExistingMemberWithSameNodeIDIsRejected(t, pb.AddObserver, fs)
+	testAddExistingMemberWithSameNodeIDIsRejected(t, pb.AddNonVoting, fs)
 }
 
 func TestHandleConfChangeRemoveNode(t *testing.T) {
@@ -1390,16 +1393,17 @@ func TestSnapshotCanBeApplied(t *testing.T) {
 		ds2 := NewNativeSM(config, NewInMemStateMachine(store2), make(chan struct{}))
 		nodeProxy2 := newTestNodeProxy()
 		snapshotter2 := newTestSnapshotter(fs)
+		snapshotter2.index = commit.Index
 		sm2 := NewStateMachine(ds2, snapshotter2, config, nodeProxy2, fs)
 		if len(sm2.members.members.Addresses) != 0 {
 			t.Errorf("unexpected member length")
 		}
-		index2, err := sm2.Recover(commit)
+		ss2, err := sm2.Recover(commit)
 		if err != nil {
 			t.Errorf("apply snapshot failed %v", err)
 		}
-		if index2 != index {
-			t.Errorf("last applied %d, want %d", index2, index)
+		if ss2.Index != index {
+			t.Errorf("last applied %d, want %d", ss2.Index, index)
 		}
 		hash2, _ := sm2.GetHash()
 		if hash1 != hash2 {
@@ -1879,26 +1883,144 @@ func TestEntryAppliedInDiskSM(t *testing.T) {
 	}
 }
 
+func TestRecoverSMRequired2(t *testing.T) {
+	tests := []struct {
+		init          bool
+		ssOnDiskIndex uint64
+		onDiskIndex   uint64
+		shouldPanic   bool
+	}{
+		{true, 100, 100, false},
+		{true, 200, 100, true},
+		{true, 300, 100, true},
+
+		{true, 100, 200, false},
+		{true, 200, 200, false},
+		{true, 300, 200, true},
+
+		{true, 100, 300, false},
+		{true, 200, 300, false},
+		{true, 300, 300, false},
+
+		{false, 100, 100, false},
+		{false, 200, 100, true},
+		{false, 300, 100, true},
+
+		{false, 100, 200, false},
+		{false, 200, 200, false},
+		{false, 300, 200, true},
+
+		{false, 100, 300, false},
+		{false, 200, 300, false},
+		{false, 300, 300, false},
+	}
+	ssIndex := uint64(200)
+	node := newTestNodeProxy()
+	for idx, tt := range tests {
+		sm := &StateMachine{
+			onDiskSM: true,
+			node:     node,
+		}
+		if tt.init {
+			sm.onDiskInitIndex = tt.onDiskIndex
+		} else {
+			sm.onDiskIndex = tt.onDiskIndex
+		}
+		ss := pb.Snapshot{
+			Index:       ssIndex,
+			OnDiskIndex: tt.ssOnDiskIndex,
+		}
+		func() {
+			defer func() {
+				r := recover()
+				if tt.shouldPanic && r == nil {
+					t.Fatalf("%d, did not panic", idx)
+				} else if !tt.shouldPanic && r != nil {
+					t.Fatalf("%d, should not panic", idx)
+				}
+			}()
+			sm.checkPartialSnapshotApplyOnDiskSM(ss, tt.init)
+		}()
+	}
+}
+
 func TestRecoverSMRequired(t *testing.T) {
 	tests := []struct {
-		shrunk          bool
+		witness         bool
+		dummy           bool
 		init            bool
 		onDiskIndex     uint64
 		onDiskInitIndex uint64
 		required        bool
 	}{
-		{true, true, 100, 100, false},
-		{true, true, 200, 100, false},
-		{true, true, 100, 200, false},
-		{true, false, 100, 100, false},
-		{true, false, 200, 100, false},
-		{true, false, 100, 200, false},
-		{false, true, 100, 100, false},
-		{false, true, 200, 100, true},
-		{false, true, 100, 200, false},
-		{false, false, 100, 100, false},
-		{false, false, 200, 100, true},
-		{false, false, 100, 200, false},
+		{false, false, true, 100, 100, false},
+		{false, false, true, 200, 100, true},
+		{false, false, true, 100, 200, false},
+		{false, false, false, 100, 100, false},
+		{false, false, false, 200, 100, true},
+		{false, false, false, 100, 200, false},
+
+		{false, true, true, 100, 100, false},
+		{false, true, true, 200, 100, false},
+		{false, true, true, 100, 200, false},
+		{false, true, false, 100, 100, false},
+		{false, true, false, 200, 100, false},
+		{false, true, false, 100, 200, false},
+
+		{true, false, true, 100, 100, false},
+		{true, false, true, 200, 100, false},
+		{true, false, true, 100, 200, false},
+		{true, false, false, 100, 100, false},
+		{true, false, false, 200, 100, false},
+		{true, false, false, 100, 200, false},
+
+		{true, true, true, 100, 100, false},
+		{true, true, true, 200, 100, false},
+		{true, true, true, 100, 200, false},
+		{true, true, false, 100, 100, false},
+		{true, true, false, 200, 100, false},
+		{true, true, false, 100, 200, false},
+	}
+	ssIndex := uint64(200)
+	for idx, tt := range tests {
+		sm := &StateMachine{
+			onDiskSM:        true,
+			onDiskInitIndex: tt.onDiskInitIndex,
+			onDiskIndex:     tt.onDiskInitIndex,
+		}
+		ss := pb.Snapshot{
+			Index:       ssIndex,
+			OnDiskIndex: tt.onDiskIndex,
+			Witness:     tt.witness,
+			Dummy:       tt.dummy,
+		}
+		func() {
+			defer func() {
+				if tt.dummy || tt.witness {
+					if r := recover(); r == nil {
+						t.Fatalf("%d, not panic", idx)
+					}
+				}
+
+			}()
+			if res := sm.recoverRequired(ss, tt.init); res != tt.required {
+				t.Errorf("%d, result %t, want %t", idx, res, tt.required)
+			}
+		}()
+	}
+}
+
+func TestIsShrunkSnapshot(t *testing.T) {
+	tests := []struct {
+		shrunk   bool
+		init     bool
+		isShrunk bool
+	}{
+		{false, false, false},
+		{false, true, false},
+
+		{true, false, false},
+		{true, true, true},
 	}
 	ssIndex := uint64(200)
 	for idx, tt := range tests {
@@ -1917,11 +2039,9 @@ func TestRecoverSMRequired(t *testing.T) {
 			}
 			snapshotter := newTestSnapshotter(fs)
 			sm := &StateMachine{
-				snapshotter:     snapshotter,
-				onDiskSM:        true,
-				onDiskInitIndex: tt.onDiskInitIndex,
-				onDiskIndex:     tt.onDiskInitIndex,
-				fs:              fs,
+				snapshotter: snapshotter,
+				onDiskSM:    true,
+				fs:          fs,
 			}
 			fp := snapshotter.getFilePath(ssIndex)
 			if tt.shrunk {
@@ -1953,8 +2073,7 @@ func TestRecoverSMRequired(t *testing.T) {
 				}
 			}
 			ss := pb.Snapshot{
-				Index:       ssIndex,
-				OnDiskIndex: tt.onDiskIndex,
+				Index: ssIndex,
 			}
 			defer func() {
 				if !tt.init && tt.shrunk {
@@ -1963,8 +2082,12 @@ func TestRecoverSMRequired(t *testing.T) {
 					}
 				}
 			}()
-			if res := sm.recoverRequired(ss, tt.init); res != tt.required {
-				t.Errorf("%d, result %t, want %t", idx, res, tt.required)
+			res, err := sm.isShrunkSnapshot(ss, tt.init)
+			if err != nil {
+				t.Fatalf("isShrunkSnapshot failed %v", err)
+			}
+			if res != tt.isShrunk {
+				t.Errorf("%d, result %t, want %t", idx, res, tt.isShrunk)
 			}
 		}()
 		reportLeakedFD(fs, t)
@@ -2016,11 +2139,15 @@ func TestAlreadyAppliedInOnDiskSMEntryTreatedAsNoOP(t *testing.T) {
 }
 
 type testManagedStateMachine struct {
-	first        uint64
-	last         uint64
-	synced       bool
-	nalookup     bool
-	corruptIndex bool
+	first          uint64
+	last           uint64
+	synced         bool
+	nalookup       bool
+	corruptIndex   bool
+	concurrent     bool
+	onDisk         bool
+	smType         pb.StateMachineType
+	prepareInvoked bool
 }
 
 func (t *testManagedStateMachine) Open() (uint64, error) { return 10, nil }
@@ -2042,8 +2169,11 @@ func (t *testManagedStateMachine) Sync() error {
 	t.synced = true
 	return nil
 }
-func (t *testManagedStateMachine) GetHash() (uint64, error)      { return 0, nil }
-func (t *testManagedStateMachine) Prepare() (interface{}, error) { return nil, nil }
+func (t *testManagedStateMachine) GetHash() (uint64, error) { return 0, nil }
+func (t *testManagedStateMachine) Prepare() (interface{}, error) {
+	t.prepareInvoked = true
+	return nil, nil
+}
 func (t *testManagedStateMachine) Save(SSMeta,
 	io.Writer, []byte, sm.ISnapshotFileCollection) (bool, error) {
 	return false, nil
@@ -2054,11 +2184,11 @@ func (t *testManagedStateMachine) Recover(io.Reader, []sm.SnapshotFile) error {
 func (t *testManagedStateMachine) Stream(interface{}, io.Writer) error { return nil }
 func (t *testManagedStateMachine) Offloaded() bool                     { return false }
 func (t *testManagedStateMachine) Loaded()                             {}
-func (t *testManagedStateMachine) Close()                              {}
+func (t *testManagedStateMachine) Close() error                        { return nil }
 func (t *testManagedStateMachine) DestroyedC() <-chan struct{}         { return nil }
-func (t *testManagedStateMachine) Concurrent() bool                    { return false }
-func (t *testManagedStateMachine) OnDisk() bool                        { return false }
-func (t *testManagedStateMachine) Type() pb.StateMachineType           { return 0 }
+func (t *testManagedStateMachine) Concurrent() bool                    { return t.concurrent }
+func (t *testManagedStateMachine) OnDisk() bool                        { return t.onDisk }
+func (t *testManagedStateMachine) Type() pb.StateMachineType           { return t.smType }
 func (t *testManagedStateMachine) BatchedUpdate(ents []sm.Entry) ([]sm.Entry, error) {
 	if !t.corruptIndex {
 		t.first = ents[0].Index
@@ -2068,7 +2198,6 @@ func (t *testManagedStateMachine) BatchedUpdate(ents []sm.Entry) ([]sm.Entry, er
 			ents[idx].Index = ents[idx].Index + 1
 		}
 	}
-
 	return ents, nil
 }
 
@@ -2338,28 +2467,6 @@ func TestIsDummySnapshot(t *testing.T) {
 	}
 }
 
-func TestWitnessNodeIsNeverConsideredAsOnDiskSM(t *testing.T) {
-	tests := []struct {
-		onDiskSM  bool
-		isWitness bool
-		result    bool
-	}{
-		{true, true, false},
-		{true, false, true},
-		{false, true, false},
-		{false, false, false},
-	}
-	for idx, tt := range tests {
-		sm := &StateMachine{
-			onDiskSM:  tt.onDiskSM,
-			isWitness: tt.isWitness,
-		}
-		if sm.OnDiskStateMachine() != tt.result {
-			t.Errorf("%d, got %t, want %t", idx, sm.OnDiskStateMachine(), tt.result)
-		}
-	}
-}
-
 func TestWitnessNodePanicWhenSavingSnapshot(t *testing.T) {
 	sm := &StateMachine{isWitness: true}
 	defer func() {
@@ -2410,4 +2517,283 @@ func TestSetLastApplied(t *testing.T) {
 			}
 		}()
 	}
+}
+
+func TestSavingDummySnapshot(t *testing.T) {
+	tests := []struct {
+		smType    pb.StateMachineType
+		streaming bool
+		export    bool
+		result    bool
+	}{
+		{pb.RegularStateMachine, true, false, false},
+		{pb.RegularStateMachine, false, true, false},
+		{pb.RegularStateMachine, false, false, false},
+		{pb.ConcurrentStateMachine, true, false, false},
+		{pb.ConcurrentStateMachine, false, true, false},
+		{pb.ConcurrentStateMachine, false, false, false},
+		{pb.OnDiskStateMachine, true, false, false},
+		{pb.OnDiskStateMachine, false, true, false},
+		{pb.OnDiskStateMachine, false, false, true},
+	}
+	for idx, tt := range tests {
+		sm := StateMachine{
+			onDiskSM: tt.smType == pb.OnDiskStateMachine,
+		}
+		var rt SSReqType
+		if tt.export && tt.streaming {
+			panic("bad test input")
+		}
+		if tt.export {
+			rt = Exported
+		} else if tt.streaming {
+			rt = Streaming
+		}
+		if r := sm.savingDummySnapshot(SSRequest{Type: rt}); r != tt.result {
+			t.Errorf("%d, got %t, want %t", idx, r, tt.result)
+		}
+	}
+}
+
+func TestPrepareIsNotCalledWhenSavingDummySnapshot(t *testing.T) {
+	tests := []struct {
+		onDiskSM       bool
+		streaming      bool
+		export         bool
+		prepareInvoked bool
+	}{
+		{true, false, false, false},
+		{true, true, false, true},
+		{true, false, true, true},
+		{false, false, false, true},
+		{false, false, true, true},
+	}
+
+	for idx, tt := range tests {
+		msm := &testManagedStateMachine{
+			concurrent: true,
+			onDisk:     tt.onDiskSM,
+			smType:     pb.ConcurrentStateMachine,
+		}
+		if tt.onDiskSM {
+			msm.smType = pb.OnDiskStateMachine
+		}
+		m := membership{
+			members: pb.Membership{
+				Addresses: map[uint64]string{1: "localhost:1234"},
+			},
+		}
+		sm := StateMachine{
+			index:    100,
+			onDiskSM: tt.onDiskSM,
+			sm:       msm,
+			members:  m,
+			node:     &testNodeProxy{},
+			sessions: NewSessionManager(),
+		}
+		var rt SSReqType
+		if tt.export && tt.streaming {
+			panic("bad test input")
+		}
+		if tt.export {
+			rt = Exported
+		} else if tt.streaming {
+			rt = Streaming
+		}
+		meta, err := sm.prepare(SSRequest{Type: rt})
+		if err != nil {
+			t.Errorf("prepare failed, %v", err)
+		}
+		if meta.Index != 100 {
+			t.Errorf("failed to get the snapshot metadata")
+		}
+		if msm.prepareInvoked != tt.prepareInvoked {
+			t.Errorf("%d, prepareInvoked got %t, want %t",
+				idx, msm.prepareInvoked, tt.prepareInvoked)
+		}
+	}
+}
+
+var errReturnedError = errors.New("test error")
+
+func expectedError(err error) bool {
+	return errors.Is(err, errReturnedError) && tests.HasStack(err)
+}
+
+type errorUpdateSM struct{}
+
+func (e *errorUpdateSM) Update(data []byte) (sm.Result, error) {
+	return sm.Result{}, errReturnedError
+}
+func (e *errorUpdateSM) Lookup(q interface{}) (interface{}, error) { return nil, nil }
+func (e *errorUpdateSM) SaveSnapshot(io.Writer,
+	sm.ISnapshotFileCollection, <-chan struct{}) error {
+	return errReturnedError
+}
+func (e *errorUpdateSM) RecoverFromSnapshot(io.Reader,
+	[]sm.SnapshotFile, <-chan struct{}) error {
+	return errReturnedError
+}
+func (e *errorUpdateSM) Close() error { return nil }
+
+func TestUpdateErrorIsReturned(t *testing.T) {
+	fs := vfs.GetTestFS()
+	defer leaktest.AfterTest(t)()
+	createTestDir(fs)
+	defer removeTestDir(fs)
+	defer reportLeakedFD(fs, t)
+	store := &errorUpdateSM{}
+	config := config.Config{ClusterID: 1, NodeID: 1}
+	ds := NewNativeSM(config, NewInMemStateMachine(store), make(chan struct{}))
+	nodeProxy := newTestNodeProxy()
+	snapshotter := newTestSnapshotter(fs)
+	sm := NewStateMachine(ds, snapshotter, config, nodeProxy, fs)
+	e1 := pb.Entry{
+		ClientID: 123,
+		SeriesID: client.NoOPSeriesID,
+		Index:    235,
+		Term:     1,
+	}
+	commit := Task{
+		Entries: []pb.Entry{e1},
+	}
+	sm.lastApplied.index = 234
+	sm.index = 234
+	sm.taskQ.Add(commit)
+	batch := make([]Task, 0, 8)
+	if _, err := sm.Handle(batch, nil); !expectedError(err) {
+		t.Fatalf("failed to return the expected error, %v", err)
+	}
+}
+
+type errorNodeProxy struct{}
+
+func (e *errorNodeProxy) StepReady()                                        {}
+func (e *errorNodeProxy) RestoreRemotes(pb.Snapshot) error                  { return errReturnedError }
+func (e *errorNodeProxy) ApplyUpdate(pb.Entry, sm.Result, bool, bool, bool) {}
+func (e *errorNodeProxy) ApplyConfigChange(pb.ConfigChange, uint64, bool) error {
+	return errReturnedError
+}
+func (e *errorNodeProxy) NodeID() uint64              { return 1 }
+func (e *errorNodeProxy) ClusterID() uint64           { return 1 }
+func (e *errorNodeProxy) ShouldStop() <-chan struct{} { return make(chan struct{}) }
+
+func TestConfigChangeErrorIsReturned(t *testing.T) {
+	fs := vfs.GetTestFS()
+	defer leaktest.AfterTest(t)()
+	createTestDir(fs)
+	defer removeTestDir(fs)
+	defer reportLeakedFD(fs, t)
+	store := &errorUpdateSM{}
+	config := config.Config{ClusterID: 1, NodeID: 1}
+	ds := NewNativeSM(config, NewInMemStateMachine(store), make(chan struct{}))
+	nodeProxy := &errorNodeProxy{}
+	snapshotter := newTestSnapshotter(fs)
+	sm := NewStateMachine(ds, snapshotter, config, nodeProxy, fs)
+	cc := pb.ConfigChange{
+		ConfigChangeId: 1,
+		Type:           pb.AddNode,
+		NodeID:         2,
+		Address:        "localhost:1222",
+	}
+	data, err := cc.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	e := pb.Entry{
+		Cmd:   data,
+		Type:  pb.ConfigChangeEntry,
+		Index: 235,
+		Term:  1,
+	}
+	commit := Task{
+		Entries: []pb.Entry{e},
+	}
+	sm.lastApplied.index = 234
+	sm.index = 234
+	sm.taskQ.Add(commit)
+	// two commits to handle
+	batch := make([]Task, 0, 8)
+	if _, err := sm.Handle(batch, nil); !expectedError(err) {
+		t.Fatalf("failed to return the expected error, %v", err)
+	}
+}
+
+func TestSaveErrorIsReturned(t *testing.T) {
+	fs := vfs.GetTestFS()
+	defer leaktest.AfterTest(t)()
+	createTestDir(fs)
+	defer removeTestDir(fs)
+	defer reportLeakedFD(fs, t)
+	store := &errorUpdateSM{}
+	config := config.Config{ClusterID: 1, NodeID: 1}
+	ds := NewNativeSM(config, NewInMemStateMachine(store), make(chan struct{}))
+	nodeProxy := newTestNodeProxy()
+	snapshotter := newTestSnapshotter(fs)
+	sm := NewStateMachine(ds, snapshotter, config, nodeProxy, fs)
+	sm.members.members.Addresses[1] = "localhost:1234"
+	sm.lastApplied.index = 234
+	sm.index = 234
+	if _, _, err := sm.Save(SSRequest{}); !expectedError(err) {
+		t.Fatalf("failed to return expected error %v", err)
+	}
+}
+
+func TestRecoverErrorIsReturned(t *testing.T) {
+	fs := vfs.GetTestFS()
+	tf := func(t *testing.T, sm *StateMachine, ds IManagedStateMachine,
+		nodeProxy *testNodeProxy, snapshotter *testSnapshotter, store sm.IStateMachine) {
+		sm.members.members.Addresses[1] = "localhost:1234"
+		sm.lastApplied.index = 3
+		sm.index = 3
+		ss, _, err := sm.Save(SSRequest{})
+		if err != nil {
+			t.Fatalf("failed to make snapshot %v", err)
+		}
+		index := ss.Index
+		commit := Task{
+			Index: index,
+		}
+		store2 := &errorUpdateSM{}
+		config := config.Config{ClusterID: 1, NodeID: 1}
+		ds2 := NewNativeSM(config, NewInMemStateMachine(store2), make(chan struct{}))
+		nodeProxy2 := newTestNodeProxy()
+		snapshotter2 := newTestSnapshotter(fs)
+		snapshotter2.index = commit.Index
+		sm2 := NewStateMachine(ds2, snapshotter2, config, nodeProxy2, fs)
+		if _, err := sm2.Recover(commit); !expectedError(err) {
+			t.Fatalf("failed to return expected error %v", err)
+		}
+	}
+	runSMTest2(t, tf, fs)
+}
+
+func TestRestoreRemoteErrorIsReturned(t *testing.T) {
+	fs := vfs.GetTestFS()
+	tf := func(t *testing.T, sm *StateMachine, ds IManagedStateMachine,
+		nodeProxy *testNodeProxy, snapshotter *testSnapshotter, store sm.IStateMachine) {
+		sm.members.members.Addresses[1] = "localhost:1234"
+		sm.lastApplied.index = 3
+		sm.index = 3
+		ss, _, err := sm.Save(SSRequest{})
+		if err != nil {
+			t.Fatalf("failed to make snapshot %v", err)
+		}
+		index := ss.Index
+		commit := Task{
+			Index: index,
+		}
+		store2 := tests.NewKVTest(1, 1)
+		store2.(*tests.KVTest).DisableLargeDelay()
+		config := config.Config{ClusterID: 1, NodeID: 1}
+		ds2 := NewNativeSM(config, NewInMemStateMachine(store2), make(chan struct{}))
+		nodeProxy2 := &errorNodeProxy{}
+		snapshotter2 := newTestSnapshotter(fs)
+		snapshotter2.index = commit.Index
+		sm2 := NewStateMachine(ds2, snapshotter2, config, nodeProxy2, fs)
+		if _, err := sm2.Recover(commit); !expectedError(err) {
+			t.Fatalf("failed to return expected error %v", err)
+		}
+	}
+	runSMTest2(t, tf, fs)
 }

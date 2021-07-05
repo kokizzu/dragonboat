@@ -25,6 +25,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lni/goutils/syncutil"
+
 	"github.com/lni/dragonboat/v3"
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/logdb"
@@ -33,8 +35,6 @@ import (
 	"github.com/lni/dragonboat/v3/logger"
 	"github.com/lni/dragonboat/v3/raftio"
 	sm "github.com/lni/dragonboat/v3/statemachine"
-	"github.com/lni/goutils/syncutil"
-	gvfs "github.com/lni/goutils/vfs"
 )
 
 const (
@@ -57,11 +57,16 @@ var ckpt = flag.Int("checkpoint-interval", 0, "checkpoint interval")
 var tiny = flag.Bool("tiny-memory", false, "tiny LogDB memory limit")
 var twonh = flag.Bool("two-nodehosts", false, "use two nodehosts")
 
-func newBatchedLogDB(cfg config.NodeHostConfig, cb config.LogDBCallback,
+type batchedLogDBFactory struct{}
+
+func (batchedLogDBFactory) Create(cfg config.NodeHostConfig, cb config.LogDBCallback,
 	dirs []string, lldirs []string) (raftio.ILogDB, error) {
-	fs := vfs.DefaultFS
 	return logdb.NewLogDB(cfg,
-		cb, dirs, lldirs, true, false, fs, pebble.NewKVStore)
+		cb, dirs, lldirs, true, false, pebble.NewKVStore)
+}
+
+func (batchedLogDBFactory) Name() string {
+	return "Sharded-Pebble"
 }
 
 type dummyStateMachine struct{}
@@ -100,22 +105,10 @@ func (s *dummyStateMachine) Close() error { return nil }
 
 func main() {
 	flag.Parse()
-	fs := gvfs.Default
+	fs := vfs.DefaultFS
 	if *inmemfs {
 		log.Println("using in-memory fs")
-		fs = gvfs.NewMem()
-	}
-	if *cpupprof {
-		f, err := os.Create("cpu.pprof")
-		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
-		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
-		}
-		defer pprof.StopCPUProfile()
-		log.Println("cpu profile will be saved into file cpu.pprof")
+		fs = vfs.NewMemFS()
 	}
 	if *mempprof {
 		defer func() {
@@ -123,7 +116,11 @@ func main() {
 			if err != nil {
 				log.Fatal("could not create memory profile: ", err)
 			}
-			defer f.Close()
+			defer func() {
+				if err := f.Close(); err != nil {
+					panic(err)
+				}
+			}()
 			runtime.GC()
 			if err := pprof.WriteHeapProfile(f); err != nil {
 				log.Fatal("could not write memory profile: ", err)
@@ -131,13 +128,21 @@ func main() {
 		}()
 		log.Println("memory profile will be saved into file mem.pprof")
 	}
-	_ = fs.RemoveAll(dataDirectoryName)
-	_ = fs.RemoveAll(dataDirectoryName2)
+	if err := fs.RemoveAll(dataDirectoryName); err != nil {
+		panic(err)
+	}
+	if err := fs.RemoveAll(dataDirectoryName2); err != nil {
+		panic(err)
+	}
 	defer func() {
-		_ = fs.RemoveAll(dataDirectoryName)
+		if err := fs.RemoveAll(dataDirectoryName); err != nil {
+			panic(err)
+		}
 	}()
 	defer func() {
-		_ = fs.RemoveAll(dataDirectoryName2)
+		if err := fs.RemoveAll(dataDirectoryName2); err != nil {
+			panic(err)
+		}
 	}()
 	logger.GetLogger("raft").SetLevel(logger.WARNING)
 	logger.GetLogger("rsm").SetLevel(logger.WARNING)
@@ -161,13 +166,13 @@ func main() {
 	}
 	if *batched {
 		log.Println("using batched logdb")
-		nhc.LogDBFactory = newBatchedLogDB
+		nhc.Expert.LogDBFactory = batchedLogDBFactory{}
 	}
 	nh, err := dragonboat.NewNodeHost(nhc)
 	if err != nil {
 		panic(err)
 	}
-	defer nh.Stop()
+	defer nh.Close()
 	var nh2 *dragonboat.NodeHost
 	if *twonh {
 		nhc.NodeHostDir = dataDirectoryName2
@@ -176,7 +181,7 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		defer nh2.Stop()
+		defer nh2.Close()
 	}
 	rc := config.Config{
 		ClusterID:       1,
@@ -236,6 +241,23 @@ func main() {
 		panic(fmt.Sprintf("nhList len unexpected, %d", len(nhList)))
 	}
 	fmt.Printf("clusters are ready, will run for %d seconds\n", *seconds)
+	if *cpupprof {
+		f, err := os.Create("cpu.pprof")
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer func() {
+			if err := f.Close(); err != nil {
+				panic(err)
+			}
+		}()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+		log.Println("cpu profile will be saved into file cpu.pprof")
+	}
+
 	doneCh := make(chan struct{}, 1)
 	timer := time.NewTimer(time.Duration(*seconds) * time.Second)
 	defer timer.Stop()

@@ -15,12 +15,13 @@
 package dragonboat
 
 import (
-	"errors"
-	"math"
+	"strconv"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/logutil"
 
 	"github.com/lni/dragonboat/v3/internal/fileutil"
+	"github.com/lni/dragonboat/v3/internal/logdb"
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/utils/dio"
@@ -28,10 +29,6 @@ import (
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
-)
-
-const (
-	snapshotsToKeep = 3
 )
 
 func compressionType(ct pb.CompressionType) dio.CompressionType {
@@ -58,19 +55,22 @@ type snapshotter struct {
 	clusterID uint64
 	nodeID    uint64
 	logdb     raftio.ILogDB
+	logReader *logdb.LogReader
 	fs        vfs.IFS
 }
 
 var _ rsm.ISnapshotter = (*snapshotter)(nil)
 
 func newSnapshotter(clusterID uint64, nodeID uint64,
-	root server.SnapshotDirFunc, ldb raftio.ILogDB, fs vfs.IFS) *snapshotter {
+	root server.SnapshotDirFunc, ldb raftio.ILogDB,
+	logReader *logdb.LogReader, fs vfs.IFS) *snapshotter {
 	return &snapshotter{
+		clusterID: clusterID,
+		nodeID:    nodeID,
 		root:      root,
 		dir:       root(clusterID, nodeID),
 		logdb:     ldb,
-		clusterID: clusterID,
-		nodeID:    nodeID,
+		logReader: logReader,
 		fs:        fs,
 	}
 }
@@ -92,7 +92,9 @@ func (s *snapshotter) Stream(streamable rsm.IStreamable,
 	ct := compressionType(meta.CompressionType)
 	cw := dio.NewCompressor(ct, rsm.NewChunkWriter(sink, meta))
 	if err := streamable.Stream(meta.Ctx, cw); err != nil {
-		sink.Stop()
+		if cerr := sink.Close(); cerr != nil {
+			plog.Errorf("failed to close the sink %v", cerr)
+		}
 		return err
 	}
 	return cw.Close()
@@ -114,9 +116,7 @@ func (s *snapshotter) Save(savable rsm.ISavable,
 	cw := dio.NewCountedWriter(w)
 	sw := dio.NewCompressor(ct, cw)
 	defer func() {
-		if cerr := sw.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, sw.Close())
 		if ss.Index > 0 {
 			total := cw.BytesWritten()
 			ss.Checksum = w.GetPayloadChecksum()
@@ -156,21 +156,14 @@ func (s *snapshotter) Load(ss pb.Snapshot,
 			Metadata: f.Metadata,
 		})
 	}
-	reader, err := rsm.NewSnapshotReader(fp, s.fs)
+	reader, header, err := rsm.NewSnapshotReader(fp, s.fs)
 	if err != nil {
-		return err
-	}
-	header, err := reader.GetHeader()
-	if err != nil {
-		reader.Close()
 		return err
 	}
 	ct := compressionType(header.CompressionType)
 	cr := dio.NewDecompressor(ct, reader)
 	defer func() {
-		if cerr := cr.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, cr.Close())
 	}()
 	v := rsm.SSVersion(header.Version)
 	if err := sessions.LoadSessions(cr, v); err != nil {
@@ -179,39 +172,73 @@ func (s *snapshotter) Load(ss pb.Snapshot,
 	if err := asm.Recover(cr, fs); err != nil {
 		return err
 	}
-	reader.ValidatePayload(header)
 	return nil
 }
 
-func (s *snapshotter) GetSnapshot(index uint64) (pb.Snapshot, error) {
-	snapshots, err := s.logdb.ListSnapshots(s.clusterID, s.nodeID, index)
+func (s *snapshotter) GetSnapshot() (pb.Snapshot, error) {
+	ss := s.logReader.Snapshot()
+	if pb.IsEmptySnapshot(ss) {
+		return pb.Snapshot{}, ErrNoSnapshot
+	}
+	return ss, nil
+}
+
+// TODO: update this once the LogDB interface is updated to have the ability to
+// query latest snapshot.
+func (s *snapshotter) GetSnapshotFromLogDB() (pb.Snapshot, error) {
+	snapshot, err := s.logdb.GetSnapshot(s.clusterID, s.nodeID)
 	if err != nil {
 		return pb.Snapshot{}, err
 	}
-	for _, ss := range snapshots {
-		if ss.Index == index {
-			return ss, nil
+	if !pb.IsEmptySnapshot(snapshot) {
+		return snapshot, nil
+	}
+	return pb.Snapshot{}, ErrNoSnapshot
+}
+
+func (s *snapshotter) Shrink(index uint64) error {
+	ss, err := s.logdb.GetSnapshot(s.clusterID, s.nodeID)
+	if err != nil {
+		return err
+	}
+	if ss.Index < index {
+		return nil
+	}
+	if !ss.Dummy && !ss.Witness {
+		env := s.getEnv(index)
+		fp := env.GetFilepath()
+		shrunk := env.GetShrinkedFilepath()
+		plog.Infof("%s shrinking %s", s.id(), s.ssid(index))
+		if err := rsm.ShrinkSnapshot(fp, shrunk, s.fs); err != nil {
+			return err
 		}
+		return rsm.ReplaceSnapshot(shrunk, fp, s.fs)
 	}
-	return pb.Snapshot{}, ErrNoSnapshot
+	return nil
 }
 
-func (s *snapshotter) GetMostRecentSnapshot() (pb.Snapshot, error) {
-	snapshots, err := s.logdb.ListSnapshots(s.clusterID, s.nodeID, math.MaxUint64)
+func (s *snapshotter) Compact(index uint64) error {
+	ss, err := s.logdb.GetSnapshot(s.clusterID, s.nodeID)
 	if err != nil {
-		return pb.Snapshot{}, err
+		return err
 	}
-	if len(snapshots) > 0 {
-		return snapshots[len(snapshots)-1], nil
+	if ss.Index <= index {
+		plog.Panicf("%s invalid compaction, LogDB snapshot %d, index %d",
+			s.id(), ss.Index, index)
 	}
-	return pb.Snapshot{}, ErrNoSnapshot
+	plog.Debugf("%s called Compact, latest %d, to compact %d",
+		s.id(), ss.Index, index)
+	if err := s.remove(index); err != nil {
+		return err
+	}
+	return nil
 }
 
-func (s *snapshotter) IsNoSnapshotError(e error) bool {
-	return e == ErrNoSnapshot
+func (s *snapshotter) IsNoSnapshotError(err error) bool {
+	return errors.Is(err, ErrNoSnapshot)
 }
 
-func (s *snapshotter) commit(ss pb.Snapshot, req rsm.SSRequest) error {
+func (s *snapshotter) Commit(ss pb.Snapshot, req rsm.SSRequest) error {
 	env := s.getCustomEnv(rsm.SSMeta{
 		Index:   ss.Index,
 		Request: req,
@@ -220,7 +247,7 @@ func (s *snapshotter) commit(ss pb.Snapshot, req rsm.SSRequest) error {
 		return err
 	}
 	if err := env.FinalizeSnapshot(&ss); err != nil {
-		if err == server.ErrSnapshotOutOfDate {
+		if errors.Is(err, server.ErrSnapshotOutOfDate) {
 			return errSnapshotOutOfDate
 		}
 		return err
@@ -238,64 +265,25 @@ func (s *snapshotter) getFilePath(index uint64) string {
 	return env.GetFilepath()
 }
 
-func (s *snapshotter) shrink(shrinkTo uint64) error {
-	snapshots, err := s.logdb.ListSnapshots(s.clusterID, s.nodeID, shrinkTo)
-	if err != nil {
-		return err
-	}
-	plog.Debugf("%s has %d snapshots to shrink", s.id(), len(snapshots))
-	for idx, ss := range snapshots {
-		if ss.Index > shrinkTo {
-			plog.Panicf("snapshot index %d, shrink to %d", ss.Index, shrinkTo)
-		}
-		if !ss.Dummy && !ss.Witness {
-			env := s.getEnv(ss.Index)
-			fp := env.GetFilepath()
-			shrunk := env.GetShrinkedFilepath()
-			plog.Debugf("%s shrinking %s, %d", s.id(), s.ssid(ss.Index), idx)
-			if err := rsm.ShrinkSnapshot(fp, shrunk, s.fs); err != nil {
-				return err
-			}
-			if err := rsm.ReplaceSnapshot(shrunk, fp, s.fs); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (s *snapshotter) compact(removeUpTo uint64) error {
-	snapshots, err := s.logdb.ListSnapshots(s.clusterID, s.nodeID, removeUpTo)
-	if err != nil {
-		return err
-	}
-	if len(snapshots) <= snapshotsToKeep {
-		return nil
-	}
-	selected := snapshots[:len(snapshots)-snapshotsToKeep]
-	plog.Debugf("%s has %d snapshots to compact", s.id(), len(selected))
-	for _, ss := range selected {
-		plog.Debugf("%s compacting %s", s.id(), s.ssid(ss.Index))
-		if err := s.remove(ss.Index); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (s *snapshotter) processOrphans() error {
 	files, err := s.fs.List(s.dir)
 	if err != nil {
 		return err
 	}
 	noss := false
-	mrss, err := s.GetMostRecentSnapshot()
+	mrss, err := s.GetSnapshotFromLogDB()
 	if err != nil {
-		if err == ErrNoSnapshot {
+		if errors.Is(err, ErrNoSnapshot) {
 			noss = true
 		} else {
 			return err
 		}
+	}
+	removeFolder := func(fdir string) error {
+		if err := s.fs.RemoveAll(fdir); err != nil {
+			return err
+		}
+		return fileutil.SyncDir(s.dir, s.fs)
 	}
 	for _, n := range files {
 		fi, err := s.fs.Stat(s.fs.PathJoin(s.dir, n))
@@ -334,11 +322,15 @@ func (s *snapshotter) processOrphans() error {
 				}
 			}
 		} else if s.isZombie(fi.Name()) {
-			if err := s.fs.RemoveAll(fdir); err != nil {
+			if err := removeFolder(fdir); err != nil {
 				return err
 			}
-			if err := fileutil.SyncDir(s.dir, s.fs); err != nil {
-				return err
+		} else if s.isSnapshot(fi.Name()) {
+			index := s.parseIndex(fi.Name())
+			if noss || index != mrss.Index {
+				if err := removeFolder(fdir); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -346,9 +338,6 @@ func (s *snapshotter) processOrphans() error {
 }
 
 func (s *snapshotter) remove(index uint64) error {
-	if err := s.logdb.DeleteSnapshot(s.clusterID, s.nodeID, index); err != nil {
-		return err
-	}
 	env := s.getEnv(index)
 	return env.RemoveFinalDir()
 }
@@ -387,6 +376,26 @@ func (s *snapshotter) saveSnapshot(snapshot pb.Snapshot) error {
 
 func (s *snapshotter) dirMatch(dir string) bool {
 	return server.SnapshotDirNameRe.Match([]byte(dir))
+}
+
+func (s *snapshotter) parseIndex(dir string) uint64 {
+	if parts := server.SnapshotDirNamePartsRe.FindStringSubmatch(dir); len(parts) == 2 {
+		index, err := strconv.ParseUint(parts[1], 16, 64)
+		if err != nil {
+			plog.Panicf("failed to parse index %s", parts[1])
+		}
+		return index
+	}
+	plog.Panicf("unknown snapshot fold name: %s", dir)
+	return 0
+}
+
+func (s *snapshotter) isSnapshot(dir string) bool {
+	if !s.dirMatch(dir) {
+		return false
+	}
+	fdir := s.fs.PathJoin(s.dir, dir)
+	return !fileutil.HasFlagFile(fdir, fileutil.SnapshotFlagFilename, s.fs)
 }
 
 func (s *snapshotter) isZombie(dir string) bool {

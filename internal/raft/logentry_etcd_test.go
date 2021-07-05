@@ -24,6 +24,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/errors"
+
 	"github.com/lni/dragonboat/v3/internal/server"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
@@ -34,7 +36,7 @@ func getAllEntries(l *entryLog) []pb.Entry {
 		return ents
 	}
 	// try again if there was a racing compaction
-	if err == ErrCompacted {
+	if errors.Is(err, ErrCompacted) {
 		return getAllEntries(l)
 	}
 	panic(err)
@@ -67,7 +69,10 @@ func TestFindConflict(t *testing.T) {
 		raftLog := newEntryLog(NewTestLogDB(), server.NewInMemRateLimiter(0))
 		raftLog.append(previousEnts)
 
-		gconflict := raftLog.getConflictIndex(tt.ents)
+		gconflict, err := raftLog.getConflictIndex(tt.ents)
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
 		if gconflict != tt.wconflict {
 			t.Errorf("#%d: conflict = %d, want %d", i, gconflict, tt.wconflict)
 		}
@@ -98,7 +103,10 @@ func TestIsUpToDate(t *testing.T) {
 	}
 
 	for i, tt := range tests {
-		gUpToDate := raftLog.upToDate(tt.lastIndex, tt.term)
+		gUpToDate, err := raftLog.upToDate(tt.lastIndex, tt.term)
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
 		if gUpToDate != tt.wUpToDate {
 			t.Errorf("#%d: uptodate = %v, want %v", i, gUpToDate, tt.wUpToDate)
 		}
@@ -271,9 +279,15 @@ func TestLogMaybeAppend(t *testing.T) {
 			}()
 			var glasti uint64
 			var gappend bool
-			if raftLog.matchTerm(tt.index, tt.logTerm) {
+			match, err := raftLog.matchTerm(tt.index, tt.logTerm)
+			if err != nil {
+				t.Fatalf("unexpected error %v", err)
+			}
+			if match {
 				gappend = true
-				raftLog.tryAppend(tt.index, tt.ents)
+				if _, err := raftLog.tryAppend(tt.index, tt.ents); err != nil {
+					t.Fatalf("unexpected error %v", err)
+				}
 				glasti = tt.index + uint64(len(tt.ents))
 				raftLog.commitTo(min(glasti, tt.committed))
 			}
@@ -326,7 +340,9 @@ func TestHasNextEnts(t *testing.T) {
 		}
 		raftLog := newEntryLog(storage, server.NewInMemRateLimiter(0))
 		raftLog.append(ents)
-		raftLog.tryCommit(5, 1)
+		if _, err := raftLog.tryCommit(5, 1); err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
 		raftLog.commitUpdate(pb.UpdateCommit{Processed: tt.applied})
 
 		hasNext := raftLog.hasEntriesToApply()
@@ -361,10 +377,15 @@ func TestNextEnts(t *testing.T) {
 		}
 		raftLog := newEntryLog(storage, server.NewInMemRateLimiter(0))
 		raftLog.append(ents)
-		raftLog.tryCommit(5, 1)
+		if _, err := raftLog.tryCommit(5, 1); err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
 		raftLog.commitUpdate(pb.UpdateCommit{Processed: tt.applied})
 
-		nents := raftLog.entriesToApply()
+		nents, err := raftLog.entriesToApply()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
 		if !reflect.DeepEqual(nents, tt.wents) {
 			t.Errorf("#%d: nents = %+v, want %+v", i, nents, tt.wents)
 		}
@@ -435,7 +456,9 @@ func TestCompaction(t *testing.T) {
 				}
 			}
 			raftLog := newEntryLog(storage, server.NewInMemRateLimiter(0))
-			raftLog.tryCommit(tt.lastIndex, 0)
+			if _, err := raftLog.tryCommit(tt.lastIndex, 0); err != nil {
+				t.Fatalf("unexpected error %v", err)
+			}
 			raftLog.commitUpdate(pb.UpdateCommit{Processed: raftLog.committed})
 
 			for j := 0; j < len(tt.compact); j++ {
@@ -725,7 +748,10 @@ func TestCompactionSideEffects(t *testing.T) {
 		raftLog.append([]pb.Entry{{Term: i + 1, Index: i + 1}})
 	}
 
-	ok := raftLog.tryCommit(lastIndex, lastTerm)
+	ok, err := raftLog.tryCommit(lastIndex, lastTerm)
+	if err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
 	if !ok {
 		t.Fatalf("maybeCommit returned false")
 	}
@@ -744,7 +770,11 @@ func TestCompactionSideEffects(t *testing.T) {
 	}
 
 	for j := offset; j <= raftLog.lastIndex(); j++ {
-		if !raftLog.matchTerm(j, j) {
+		match, err := raftLog.matchTerm(j, j)
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if !match {
 			t.Errorf("matchTerm(%d) = false, want true", j)
 		}
 	}
@@ -799,7 +829,9 @@ func TestUnstableEnts(t *testing.T) {
 		raftLog.append(previousEnts[tt.unstable-1:])
 		ents := raftLog.entriesToSave()
 		if l := len(ents); l > 0 {
-			raftLog.tryCommit(ents[l-1].Index, ents[l-1].Term)
+			if _, err := raftLog.tryCommit(ents[l-1].Index, ents[l-1].Term); err != nil {
+				t.Fatalf("unexpected error %v", err)
+			}
 			cu := pb.UpdateCommit{
 				Processed:     ents[l-1].Index,
 				LastApplied:   ents[l-1].Index,

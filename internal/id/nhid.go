@@ -16,11 +16,11 @@ package id
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/random"
 )
 
@@ -94,6 +94,11 @@ func (n *NodeHostID) Marshal() ([]byte, error) {
 	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(buf, n.id)
 	return buf, nil
+}
+
+// MarshalTo is not implemented
+func (n *NodeHostID) MarshalTo(result []byte) (int, error) {
+	panic("not implemented")
 }
 
 // Unmarshal unmarshals the NodeHostID instance.

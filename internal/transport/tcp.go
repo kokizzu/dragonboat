@@ -19,13 +19,13 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
-	"errors"
 	"hash/crc32"
 	"io"
 	"net"
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/juju/ratelimit"
 	"github.com/lni/goutils/netutil"
 	"github.com/lni/goutils/syncutil"
@@ -111,12 +111,6 @@ func (h *requestHeader) decode(buf []byte) bool {
 	h.size = binary.BigEndian.Uint64(buf[2:])
 	h.crc = binary.BigEndian.Uint32(buf[14:])
 	return true
-}
-
-// Marshaler is the interface for types that can be Marshaled.
-type Marshaler interface {
-	MarshalTo([]byte) (int, error)
-	Size() int
 }
 
 func sendPoison(conn net.Conn, poison []byte) error {
@@ -355,11 +349,8 @@ func (c *TCPConnection) SendMessageBatch(batch pb.MessageBatch) error {
 	} else {
 		buf = c.payload
 	}
-	n, err := batch.MarshalTo(buf)
-	if err != nil {
-		panic(err)
-	}
-	return writeMessage(c.conn, header, buf[:n], c.header, c.encrypted)
+	buf = pb.MustMarshalTo(&batch, buf)
+	return writeMessage(c.conn, header, buf, c.header, c.encrypted)
 }
 
 // TCPSnapshotConnection is the connection for sending raft snapshot chunks to
@@ -385,7 +376,11 @@ func NewTCPSnapshotConnection(conn net.Conn,
 
 // Close closes the snapshot connection.
 func (c *TCPSnapshotConnection) Close() {
-	defer c.conn.Close()
+	defer func() {
+		if err := c.conn.Close(); err != nil {
+			plog.Debugf("failed to close the connection %v", err)
+		}
+	}()
 	if err := sendPoison(c.conn, poisonNumber[:]); err != nil {
 		return
 	}
@@ -397,11 +392,8 @@ func (c *TCPSnapshotConnection) SendChunk(chunk pb.Chunk) error {
 	header := requestHeader{method: snapshotType}
 	sz := chunk.Size()
 	buf := make([]byte, sz)
-	n, err := chunk.MarshalTo(buf)
-	if err != nil {
-		panic(err)
-	}
-	return writeMessage(c.conn, header, buf[:n], c.header, c.encrypted)
+	buf = pb.MustMarshalTo(&chunk, buf)
+	return writeMessage(c.conn, header, buf, c.header, c.encrypted)
 }
 
 // TCP is a TCP based transport module for exchanging raft messages and
@@ -493,10 +485,11 @@ func (t *TCP) Start() error {
 	return nil
 }
 
-// Stop stops the TCP transport module.
-func (t *TCP) Stop() {
+// Close closes the TCP transport module.
+func (t *TCP) Close() error {
 	t.stopper.Stop()
 	t.connStopper.Stop()
+	return nil
 }
 
 // GetConnection returns a new raftio.IConnection for sending raft messages.
@@ -533,11 +526,13 @@ func (t *TCP) serveConn(conn net.Conn) {
 	for {
 		err := readMagicNumber(conn, magicNum)
 		if err != nil {
-			if err == errPoisonReceived {
-				_ = sendPoisonAck(conn, poisonNumber[:])
+			if errors.Is(err, errPoisonReceived) {
+				if err := sendPoisonAck(conn, poisonNumber[:]); err != nil {
+					plog.Debugf("failed to send poison ack %v", err)
+				}
 				return
 			}
-			if err == ErrBadMessage {
+			if errors.Is(err, ErrBadMessage) {
 				return
 			}
 			operr, ok := err.(net.Error)

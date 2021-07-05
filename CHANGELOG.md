@@ -1,3 +1,25 @@
+## v3.4 (TBD)
+
+Dragonboat v3.4 comes with many improvements. All v3.3.x users are recommended to upgrade.
+
+### New features
+
+- Raft Pre-Vote support.
+
+### Improvements
+
+- Better error handling.
+- Simplified snapshot compaction.
+- Removed dependency on protobuf.
+- Fixed snapshot notification.
+- Fixed unreachable notification.
+- Upgraded to a more recent version of pebble.
+- Non-voting node (used to be called observer node) support has been marked as production ready.
+
+### Other changes
+
+- Raft observer node has been renamed as non-voting node.
+
 ## v3.3 (2021-01-20)
 
 Dragonboat v3.3 is a major release that comes with new features and improvements. All v3.2.x users are recommended to upgrade.

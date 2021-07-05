@@ -130,7 +130,7 @@ func getVersionedValidator(header pb.SnapshotHeader) (IVValidator, bool) {
 }
 
 // GetWitnessSnapshot returns the content of a witness snapshot.
-func GetWitnessSnapshot(fs vfs.IFS) ([]byte, error) {
+func GetWitnessSnapshot(fs vfs.IFS) (result []byte, err error) {
 	f, path, err := fileutil.TempFile("", "dragonboat-witness-snapshot", fs)
 	if err != nil {
 		return nil, err
@@ -140,7 +140,6 @@ func GetWitnessSnapshot(fs vfs.IFS) ([]byte, error) {
 		return nil, err
 	}
 	if _, err := w.Write(GetEmptyLRUSession()); err != nil {
-		w.Close()
 		return nil, err
 	}
 	if err := w.Close(); err != nil {
@@ -150,7 +149,9 @@ func GetWitnessSnapshot(fs vfs.IFS) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer df.Close()
+	defer func() {
+		err = firstError(err, df.Close())
+	}()
 	buf := bytes.NewBuffer(nil)
 	if _, err = io.Copy(buf, df); err != nil {
 		return nil, err
@@ -160,11 +161,12 @@ func GetWitnessSnapshot(fs vfs.IFS) ([]byte, error) {
 
 // SnapshotWriter is an io.Writer used to write snapshot file.
 type SnapshotWriter struct {
-	vw   IVWriter
-	file vfs.File
-	fs   vfs.IFS
-	fp   string
-	ct   pb.CompressionType
+	vw     IVWriter
+	file   vfs.File
+	fs     vfs.IFS
+	fp     string
+	ct     pb.CompressionType
+	closed bool
 }
 
 // NewSnapshotWriter creates a new snapshot writer instance.
@@ -199,20 +201,13 @@ func newSnapshotWriter(f vfs.File, fp string,
 }
 
 // Close closes the snapshot writer instance.
-func (sw *SnapshotWriter) Close() error {
-	if err := sw.flush(); err != nil {
-		return err
-	}
-	if err := sw.saveHeader(); err != nil {
-		return err
-	}
-	if err := sw.file.Sync(); err != nil {
-		return err
-	}
-	if err := sw.file.Close(); err != nil {
-		return err
-	}
-	return fileutil.SyncDir(sw.fs.PathDir(sw.fp), sw.fs)
+func (sw *SnapshotWriter) Close() (err error) {
+	sw.closed = true
+	err = firstError(err, sw.flush())
+	err = firstError(err, sw.saveHeader())
+	err = firstError(err, sw.file.Sync())
+	err = firstError(err, sw.file.Close())
+	return firstError(err, fileutil.SyncDir(sw.fs.PathDir(sw.fp), sw.fs))
 }
 
 // Write writes the specified data to the snapshot.
@@ -222,11 +217,17 @@ func (sw *SnapshotWriter) Write(data []byte) (int, error) {
 
 // GetPayloadSize returns the payload size.
 func (sw *SnapshotWriter) GetPayloadSize(sz uint64) uint64 {
+	if !sw.closed {
+		panic("not closed")
+	}
 	return sw.vw.GetPayloadSize(sz)
 }
 
 // GetPayloadChecksum returns the payload checksum.
 func (sw *SnapshotWriter) GetPayloadChecksum() []byte {
+	if !sw.closed {
+		panic("not closed")
+	}
 	return sw.vw.GetPayloadSum()
 }
 
@@ -244,19 +245,13 @@ func (sw *SnapshotWriter) saveHeader() error {
 		Version:         uint64(sw.vw.GetVersion()),
 		CompressionType: sw.ct,
 	}
-	data, err := sh.Marshal()
-	if err != nil {
-		panic(err)
-	}
+	data := pb.MustMarshal(&sh)
 	headerHash := getDefaultChecksum()
 	if _, err := headerHash.Write(data); err != nil {
 		return err
 	}
 	sh.HeaderChecksum = headerHash.Sum(nil)
-	data, err = sh.Marshal()
-	if err != nil {
-		panic(err)
-	}
+	data = pb.MustMarshal(&sh)
 	if uint64(len(data)) > HeaderSize-8 {
 		panic("snapshot header is too large")
 	}
@@ -279,63 +274,69 @@ type SnapshotReader struct {
 }
 
 // NewSnapshotReader creates a new snapshot reader instance.
-func NewSnapshotReader(fp string, fs vfs.IFS) (*SnapshotReader, error) {
+func NewSnapshotReader(fp string,
+	fs vfs.IFS) (*SnapshotReader, pb.SnapshotHeader, error) {
 	f, err := fs.Open(fp)
 	if err != nil {
-		return nil, err
+		return nil, pb.SnapshotHeader{}, err
 	}
-	return &SnapshotReader{file: f}, nil
+	r := &SnapshotReader{file: f}
+	header, err := r.getHeader()
+	if err != nil {
+		return nil, pb.SnapshotHeader{}, err
+	}
+	return r, header, nil
 }
 
 // Close closes the snapshot reader instance.
 func (sr *SnapshotReader) Close() error {
+	// defer is used here to make sure file is always closed, otherwise tests that
+	// panic in validatePayload() will complain about not closed file.
+	defer sr.validatePayload()
 	return sr.file.Close()
 }
 
-// GetHeader returns the snapshot header instance.
-func (sr *SnapshotReader) GetHeader() (pb.SnapshotHeader, error) {
+// Read reads up to len(data) bytes from the snapshot file.
+func (sr *SnapshotReader) Read(data []byte) (int, error) {
+	return sr.r.Read(data)
+}
+
+func (sr *SnapshotReader) validatePayload() {
+	if sr.header.Version == uint64(V1) {
+		if !bytes.Equal(sr.r.Sum(), sr.header.PayloadChecksum) {
+			panic("corrupted snapshot payload")
+		}
+	}
+}
+
+func (sr *SnapshotReader) getHeader() (pb.SnapshotHeader, error) {
+	if sr.r != nil {
+		panic("getHeader called again?")
+	}
 	empty := pb.SnapshotHeader{}
 	lenbuf := make([]byte, 8)
-	n, err := io.ReadFull(sr.file, lenbuf)
-	if err != nil {
+	if _, err := io.ReadFull(sr.file, lenbuf); err != nil {
 		return empty, err
-	}
-	if n != len(lenbuf) {
-		return empty, io.ErrUnexpectedEOF
 	}
 	sz := binary.LittleEndian.Uint64(lenbuf)
 	if sz > HeaderSize-8 {
 		panic("invalid snapshot header size")
 	}
 	data := make([]byte, sz)
-	n, err = io.ReadFull(sr.file, data)
-	if err != nil {
+	if _, err := io.ReadFull(sr.file, data); err != nil {
 		return empty, err
 	}
-	if n != len(data) {
-		return empty, io.ErrUnexpectedEOF
-	}
-	if err := sr.header.Unmarshal(data); err != nil {
-		panic(err)
-	}
+	pb.MustUnmarshal(&sr.header, data)
 	crcdata := make([]byte, 4)
-	n, err = io.ReadFull(sr.file, crcdata)
-	if err != nil {
+	if _, err := io.ReadFull(sr.file, crcdata); err != nil {
 		return empty, err
-	}
-	if n != 4 {
-		return empty, io.ErrUnexpectedEOF
 	}
 	if !validateHeader(data, crcdata) {
 		panic("corrupted header")
 	}
 	blank := make([]byte, HeaderSize-8-sz-4)
-	n, err = io.ReadFull(sr.file, blank)
-	if err != nil {
+	if _, err := io.ReadFull(sr.file, blank); err != nil {
 		return empty, err
-	}
-	if n != len(blank) {
-		return empty, io.ErrUnexpectedEOF
 	}
 	var reader io.Reader = sr.file
 	v := SSVersion(sr.header.Version)
@@ -351,28 +352,6 @@ func (sr *SnapshotReader) GetHeader() (pb.SnapshotHeader, error) {
 	return sr.header, nil
 }
 
-// Read reads up to len(data) bytes from the snapshot file.
-func (sr *SnapshotReader) Read(data []byte) (int, error) {
-	if sr.r == nil {
-		panic("Read called before GetHeader")
-	}
-	return sr.r.Read(data)
-}
-
-// ValidatePayload validates whether the snapshot content matches the checksum
-// recorded in the header.
-func (sr *SnapshotReader) ValidatePayload(header pb.SnapshotHeader) {
-	if sr.r == nil {
-		panic("ValidatePayload called when the header is not even read")
-	}
-	if sr.header.Version == uint64(V1) {
-		checksum := sr.r.Sum()
-		if !bytes.Equal(checksum, header.PayloadChecksum) {
-			panic("corrupted snapshot payload")
-		}
-	}
-}
-
 var fourZeroBytes = []byte{0, 0, 0, 0}
 
 func validateHeader(header []byte, crc32 []byte) bool {
@@ -381,9 +360,7 @@ func validateHeader(header []byte, crc32 []byte) bool {
 	}
 	if !bytes.Equal(crc32, fourZeroBytes) {
 		h := newCRC32Hash()
-		if _, err := h.Write(header); err != nil {
-			panic(err)
-		}
+		fileutil.MustWrite(h, header)
 		return bytes.Equal(h.Sum(nil), crc32)
 	}
 	return true
@@ -415,9 +392,7 @@ func (v *SnapshotValidator) AddChunk(data []byte, chunkID uint64) bool {
 			return false
 		}
 		var headerRec pb.SnapshotHeader
-		if err := headerRec.Unmarshal(header); err != nil {
-			panic(err)
-		}
+		pb.MustUnmarshal(&headerRec, header)
 		v.v, ok = getVersionedValidator(headerRec)
 		if !ok {
 			return false
@@ -442,18 +417,13 @@ func (v *SnapshotValidator) Validate() bool {
 // IsShrunkSnapshotFile returns a boolean flag indicating whether the
 // specified snapshot file is already shrunk.
 func IsShrunkSnapshotFile(fp string, fs vfs.IFS) (shrunk bool, err error) {
-	reader, err := NewSnapshotReader(fp, fs)
+	reader, _, err := NewSnapshotReader(fp, fs)
 	if err != nil {
 		return false, err
 	}
 	defer func() {
-		if cerr := reader.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, reader.Close())
 	}()
-	if _, err = reader.GetHeader(); err != nil {
-		return false, err
-	}
 	sz := make([]byte, 8)
 	if _, err := io.ReadFull(reader, sz); err != nil {
 		return false, err
@@ -465,13 +435,13 @@ func IsShrunkSnapshotFile(fp string, fs vfs.IFS) (shrunk bool, err error) {
 		return false, nil
 	}
 	oneByte := make([]byte, 1)
-	n, err := io.ReadFull(reader, oneByte)
-	if err == nil || n != 0 {
-		return false, nil
-	} else if err == io.ErrUnexpectedEOF || err == io.EOF {
+	if _, err := io.ReadFull(reader, oneByte); err != nil {
+		if err != io.EOF && err != io.ErrUnexpectedEOF {
+			return false, err
+		}
 		return true, nil
 	}
-	return false, err
+	return false, nil
 }
 
 func mustInSameDir(fp string, newFp string, fs vfs.IFS) {
@@ -485,27 +455,20 @@ func mustInSameDir(fp string, newFp string, fs vfs.IFS) {
 // shrunk version to the path specified by newFp.
 func ShrinkSnapshot(fp string, newFp string, fs vfs.IFS) (err error) {
 	mustInSameDir(fp, newFp, fs)
-	reader, err := NewSnapshotReader(fp, fs)
+	reader, _, err := NewSnapshotReader(fp, fs)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if cerr := reader.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, reader.Close())
 	}()
 	writer, err := NewSnapshotWriter(newFp, pb.NoCompression, fs)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if cerr := writer.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, writer.Close())
 	}()
-	if _, err := reader.GetHeader(); err != nil {
-		return err
-	}
 	if _, err := writer.Write(GetEmptyLRUSession()); err != nil {
 		return err
 	}

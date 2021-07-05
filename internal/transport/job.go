@@ -16,9 +16,9 @@ package transport
 
 import (
 	"context"
-	"errors"
 	"sync/atomic"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/logutil"
 
 	"github.com/lni/dragonboat/v3/internal/vfs"
@@ -49,9 +49,10 @@ func (s *Sink) Receive(chunk pb.Chunk) (bool, bool) {
 	return s.j.AddChunk(chunk)
 }
 
-// Stop stops the sink processing.
-func (s *Sink) Stop() {
+// Close closes the sink processing.
+func (s *Sink) Close() error {
 	s.Receive(pb.Chunk{ChunkCount: pb.PoisonChunkCount})
+	return nil
 }
 
 // ClusterID returns the cluster ID of the source node.
@@ -124,8 +125,7 @@ func (j *job) connect(addr string) error {
 	return nil
 }
 
-func (j *job) addSnapshot(m pb.Message) {
-	chunks := splitSnapshotMessage(m, j.fs)
+func (j *job) addSnapshot(chunks []pb.Chunk) {
 	if len(chunks) != cap(j.ch) {
 		plog.Panicf("cap of ch is %d, want %d", cap(j.ch), len(chunks))
 	}
@@ -227,15 +227,16 @@ func (j *job) sendChunks(chunks []pb.Chunk) error {
 		}
 		chunk.DeploymentId = j.deploymentID
 		if !chunk.Witness {
+			// TODO: add a test for such error
+			// TODO: add a test to show that failed sendChunks for other reasons will
+			// 			 be reported
 			data, err := loadChunkData(chunk, chunkData, j.fs)
 			if err != nil {
-				plog.Errorf("failed to read the snapshot chunk, %v", err)
-				return err
+				panicNow(err)
 			}
 			chunk.Data = data
 		}
 		if err := j.sendChunk(chunk, j.conn); err != nil {
-			plog.Debugf("send chunk to %s failed", dn(chunk.ClusterId, chunk.NodeId))
 			return err
 		}
 		if f := j.postSend.Load(); f != nil {

@@ -26,7 +26,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -34,6 +33,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lni/dragonboat/v3/internal/fileutil"
 	"github.com/lni/dragonboat/v3/internal/tests/kvpb"
 	sm "github.com/lni/dragonboat/v3/statemachine"
 	"github.com/lni/goutils/random"
@@ -195,7 +195,7 @@ func checkExternalFile(files []sm.SnapshotFile, clusterID uint64) {
 		panic("FileID value not expected")
 	}
 	wcontent := string(fr.Metadata)
-	content, err := ioutil.ReadFile(fr.Filepath)
+	content, err := fileutil.ReadFile(fr.Filepath)
 	if err != nil {
 		panic(err)
 	}
@@ -272,7 +272,7 @@ func (s *KVTest) RecoverFromSnapshot(r io.Reader,
 	}
 
 	var store KVTest
-	data, err := ioutil.ReadAll(r)
+	data, err := fileutil.ReadAll(r)
 	if err != nil {
 		return err
 	}
@@ -353,7 +353,7 @@ func (v *VerboseSnapshotSM) RecoverFromSnapshot(r io.Reader,
 			total += uint64(n)
 		}
 		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if err == io.EOF {
 				break
 			}
 			return err

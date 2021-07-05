@@ -17,15 +17,18 @@ package tee
 import (
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 
+	"github.com/cockroachdb/errors"
+	"github.com/lni/goutils/logutil"
 	"github.com/lni/goutils/syncutil"
 
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/logdb"
+	"github.com/lni/dragonboat/v3/internal/logdb/kv"
 	"github.com/lni/dragonboat/v3/internal/logdb/kv/pebble"
 	"github.com/lni/dragonboat/v3/internal/logdb/kv/rocksdb"
-	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/logger"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
@@ -35,11 +38,14 @@ var (
 	plog = logger.GetLogger("LogDB")
 )
 
-func assertSameError(e1 error, e2 error) {
-	if e1 == e2 {
+var dn = logutil.DescribeNode
+
+func assertSameError(clusterID uint64, nodeID uint64, e1 error, e2 error) {
+	if errors.Is(e1, e2) || errors.Is(e2, e1) {
 		return
 	}
-	plog.Panicf("conflict errors, e1 %v, e2 %v", e1, e2)
+	plog.Panicf("conflict errors, %s, e1 %v, e2 %v",
+		dn(clusterID, nodeID), e1, e2)
 }
 
 // LogDB is a special LogDB module used for testing purposes.
@@ -50,41 +56,58 @@ type LogDB struct {
 	ndb     raftio.ILogDB
 }
 
-// NewTeeLogDB creates a new LogDB instance.
-func NewTeeLogDB(nhConfig config.NodeHostConfig,
+// NewRocksDBLogDB creates a new RocksDB based LogDB instance
+func NewRocksDBLogDB(nhConfig config.NodeHostConfig,
+	cb config.LogDBCallback,
+	dirs []string, wals []string) (raftio.ILogDB, error) {
+	return newKVLogDB(nhConfig, cb, dirs, wals, "tee-rocksdb", rocksdb.NewKVStore)
+}
+
+// NewPebbleLogDB creates a new LogDB instance.
+func NewPebbleLogDB(nhConfig config.NodeHostConfig,
+	cb config.LogDBCallback,
+	dirs []string, wals []string) (raftio.ILogDB, error) {
+	return newKVLogDB(nhConfig, cb, dirs, wals, "tee-pebble", pebble.NewKVStore)
+}
+
+func newKVLogDB(nhConfig config.NodeHostConfig,
 	cb config.LogDBCallback, dirs []string, wals []string,
-	fs vfs.IFS) (raftio.ILogDB, error) {
-	odirs := make([]string, 0)
-	owals := make([]string, 0)
-	for _, v := range dirs {
-		odirs = append(odirs, filepath.Join(v, "odir"))
-	}
-	for _, v := range wals {
-		owals = append(owals, filepath.Join(v, "odir"))
-	}
-	odb, err := logdb.NewLogDB(nhConfig,
-		cb, odirs, owals, false, false, fs, rocksdb.NewKVStore)
-	if err != nil {
-		return nil, err
-	}
+	subdir string, f kv.Factory) (raftio.ILogDB, error) {
 	ndirs := make([]string, 0)
 	nwals := make([]string, 0)
 	for _, v := range dirs {
-		ndirs = append(ndirs, filepath.Join(v, "ndir"))
+		ndirs = append(ndirs, filepath.Join(v, subdir))
 	}
 	for _, v := range wals {
-		nwals = append(nwals, filepath.Join(v, "ndir"))
+		nwals = append(nwals, filepath.Join(v, subdir))
 	}
-	ndb, err := logdb.NewLogDB(nhConfig,
-		cb, ndirs, nwals, false, false, fs, pebble.NewKVStore)
+	return logdb.NewLogDB(nhConfig, cb, ndirs, nwals, false, false, f)
+}
+
+// NewTeeLogDB creates a new LogDB instance backed by a pebble and a rocksdb
+// based ILogDB.
+func NewTeeLogDB(nhConfig config.NodeHostConfig,
+	cb config.LogDBCallback,
+	dirs []string, wals []string) (raftio.ILogDB, error) {
+	odb, err := NewRocksDBLogDB(nhConfig, cb, dirs, wals)
 	if err != nil {
 		return nil, err
 	}
+	ndb, err := NewPebbleLogDB(nhConfig, cb, dirs, wals)
+	if err != nil {
+		return nil, err
+	}
+	return MakeTeeLogDB(odb, ndb), nil
+}
+
+// MakeTeeLogDB returns a LogDB instance combined from the specified odb and
+// ndb instances.
+func MakeTeeLogDB(odb raftio.ILogDB, ndb raftio.ILogDB) raftio.ILogDB {
 	return &LogDB{
 		stopper: syncutil.NewStopper(),
 		odb:     odb,
 		ndb:     ndb,
-	}, nil
+	}
 }
 
 // Name ...
@@ -93,10 +116,12 @@ func (t *LogDB) Name() string {
 }
 
 // Close ...
-func (t *LogDB) Close() {
+func (t *LogDB) Close() error {
 	t.stopper.Stop()
-	t.odb.Close()
-	t.ndb.Close()
+	if err := t.odb.Close(); err != nil {
+		return nil
+	}
+	return t.ndb.Close()
 }
 
 // BinaryFormat ...
@@ -115,12 +140,24 @@ func (t *LogDB) ListNodeInfo() ([]raftio.NodeInfo, error) {
 	defer t.mu.Unlock()
 	o, oe := t.odb.ListNodeInfo()
 	n, ne := t.ndb.ListNodeInfo()
-	assertSameError(oe, ne)
+	assertSameError(0, 0, oe, ne)
 	if oe != nil {
 		return nil, oe
 	}
+	sort.Slice(o, func(i, j int) bool {
+		if o[i].ClusterID == o[j].ClusterID {
+			return o[i].NodeID < o[j].NodeID
+		}
+		return o[i].ClusterID < o[j].ClusterID
+	})
+	sort.Slice(n, func(i, j int) bool {
+		if n[i].ClusterID == n[j].ClusterID {
+			return n[i].NodeID < n[j].NodeID
+		}
+		return n[i].ClusterID < n[j].ClusterID
+	})
 	if !reflect.DeepEqual(o, n) {
-		plog.Panicf("conflict NodeInfo list len, %+v, %+v", o, n)
+		plog.Panicf("conflict NodeInfo list, %+v, %+v", o, n)
 	}
 	return o, nil
 }
@@ -132,7 +169,7 @@ func (t *LogDB) SaveBootstrapInfo(clusterID uint64,
 	defer t.mu.Unlock()
 	oe := t.odb.SaveBootstrapInfo(clusterID, nodeID, bootstrap)
 	ne := t.ndb.SaveBootstrapInfo(clusterID, nodeID, bootstrap)
-	assertSameError(oe, ne)
+	assertSameError(clusterID, nodeID, oe, ne)
 	return oe
 }
 
@@ -143,12 +180,13 @@ func (t *LogDB) GetBootstrapInfo(clusterID uint64,
 	defer t.mu.Unlock()
 	ob, oe := t.odb.GetBootstrapInfo(clusterID, nodeID)
 	nb, ne := t.ndb.GetBootstrapInfo(clusterID, nodeID)
-	assertSameError(oe, ne)
+	assertSameError(clusterID, nodeID, oe, ne)
 	if oe != nil {
 		return pb.Bootstrap{}, oe
 	}
 	if !reflect.DeepEqual(ob, nb) {
-		plog.Panicf("conflict GetBootstrapInfo values, %+v, %+v", ob, nb)
+		plog.Panicf("%s conflict GetBootstrapInfo values, %+v, %+v",
+			dn(clusterID, nodeID), ob, nb)
 	}
 	return ob, nil
 }
@@ -159,7 +197,7 @@ func (t *LogDB) SaveRaftState(updates []pb.Update, shardID uint64) error {
 	defer t.mu.Unlock()
 	oe := t.odb.SaveRaftState(updates, shardID)
 	ne := t.ndb.SaveRaftState(updates, shardID)
-	assertSameError(oe, ne)
+	assertSameError(0, 0, oe, ne)
 	return oe
 }
 
@@ -169,19 +207,26 @@ func (t *LogDB) IterateEntries(ents []pb.Entry,
 	high uint64, maxSize uint64) ([]pb.Entry, uint64, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	ce := make([]pb.Entry, len(ents))
+	copy(ce, ents)
 	ov, os, oe := t.odb.IterateEntries(ents,
 		size, clusterID, nodeID, low, high, maxSize)
-	nv, ns, ne := t.ndb.IterateEntries(ents,
+	nv, ns, ne := t.ndb.IterateEntries(ce,
 		size, clusterID, nodeID, low, high, maxSize)
-	assertSameError(oe, ne)
+	assertSameError(0, 0, oe, ne)
 	if oe != nil {
 		return nil, 0, oe
 	}
 	if os != ns {
-		plog.Panicf("conflict sizes, %d, %d", os, ns)
+		plog.Infof("")
+		plog.Panicf("%s conflict sizes, %d, %d, %+v, %+v",
+			dn(clusterID, nodeID), os, ns, ov, nv)
 	}
-	if !reflect.DeepEqual(ov, nv) {
-		plog.Panicf("conflict entry lists, %+v, %+v", ov, nv)
+	if len(ov) != 0 || len(nv) != 0 {
+		if !reflect.DeepEqual(ov, nv) {
+			plog.Panicf("%s conflict entry lists, len: %d, %+v \n\n len: %d, %+v",
+				dn(clusterID, nodeID), len(ov), ov, len(nv), nv)
+		}
 	}
 	return ov, os, nil
 }
@@ -193,12 +238,13 @@ func (t *LogDB) ReadRaftState(clusterID uint64,
 	defer t.mu.Unlock()
 	os, oe := t.odb.ReadRaftState(clusterID, nodeID, lastIndex)
 	ns, ne := t.odb.ReadRaftState(clusterID, nodeID, lastIndex)
-	assertSameError(oe, ne)
+	assertSameError(clusterID, nodeID, oe, ne)
 	if oe != nil {
 		return raftio.RaftState{}, oe
 	}
 	if !reflect.DeepEqual(os, ns) {
-		plog.Panicf("conflict ReadRaftState values, %+v, %+v", os, ns)
+		plog.Panicf("%s conflict ReadRaftState values, %+v, %+v",
+			dn(clusterID, nodeID), os, ns)
 	}
 	return os, nil
 }
@@ -210,7 +256,7 @@ func (t *LogDB) RemoveEntriesTo(clusterID uint64,
 	defer t.mu.Unlock()
 	oe := t.odb.RemoveEntriesTo(clusterID, nodeID, index)
 	ne := t.ndb.RemoveEntriesTo(clusterID, nodeID, index)
-	assertSameError(oe, ne)
+	assertSameError(clusterID, nodeID, oe, ne)
 	return oe
 }
 
@@ -220,34 +266,24 @@ func (t *LogDB) SaveSnapshots(updates []pb.Update) error {
 	defer t.mu.Unlock()
 	oe := t.odb.SaveSnapshots(updates)
 	ne := t.ndb.SaveSnapshots(updates)
-	assertSameError(oe, ne)
+	assertSameError(0, 0, oe, ne)
 	return oe
 }
 
-// DeleteSnapshot ...
-func (t *LogDB) DeleteSnapshot(clusterID uint64,
-	nodeID uint64, index uint64) error {
+// GetSnapshot ...
+func (t *LogDB) GetSnapshot(clusterID uint64,
+	nodeID uint64) (pb.Snapshot, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	oe := t.odb.DeleteSnapshot(clusterID, nodeID, index)
-	ne := t.ndb.DeleteSnapshot(clusterID, nodeID, index)
-	assertSameError(oe, ne)
-	return oe
-}
-
-// ListSnapshots ...
-func (t *LogDB) ListSnapshots(clusterID uint64,
-	nodeID uint64, index uint64) ([]pb.Snapshot, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	ov, oe := t.odb.ListSnapshots(clusterID, nodeID, index)
-	nv, ne := t.ndb.ListSnapshots(clusterID, nodeID, index)
-	assertSameError(oe, ne)
+	ov, oe := t.odb.GetSnapshot(clusterID, nodeID)
+	nv, ne := t.ndb.GetSnapshot(clusterID, nodeID)
+	assertSameError(clusterID, nodeID, oe, ne)
 	if oe != nil {
-		return nil, oe
+		return pb.Snapshot{}, oe
 	}
 	if !reflect.DeepEqual(ov, nv) {
-		plog.Panicf("conflict snapshot lists, %+v, %+v", ov, nv)
+		plog.Panicf("%s conflict snapshot lists, \n%+v \n\n %+v",
+			dn(clusterID, nodeID), ov, nv)
 	}
 	return ov, nil
 }
@@ -258,7 +294,7 @@ func (t *LogDB) RemoveNodeData(clusterID uint64, nodeID uint64) error {
 	defer t.mu.Unlock()
 	oe := t.odb.RemoveNodeData(clusterID, nodeID)
 	ne := t.ndb.RemoveNodeData(clusterID, nodeID)
-	assertSameError(oe, ne)
+	assertSameError(clusterID, nodeID, oe, ne)
 	return oe
 }
 
@@ -268,7 +304,7 @@ func (t *LogDB) ImportSnapshot(ss pb.Snapshot, nodeID uint64) error {
 	defer t.mu.Unlock()
 	oe := t.odb.ImportSnapshot(ss, nodeID)
 	ne := t.ndb.ImportSnapshot(ss, nodeID)
-	assertSameError(oe, ne)
+	assertSameError(ss.ClusterId, nodeID, oe, ne)
 	return oe
 }
 
@@ -280,7 +316,7 @@ func (t *LogDB) CompactEntriesTo(clusterID uint64,
 	done := make(chan struct{}, 1)
 	oc, oe := t.odb.CompactEntriesTo(clusterID, nodeID, index)
 	nc, ne := t.ndb.CompactEntriesTo(clusterID, nodeID, index)
-	assertSameError(oe, ne)
+	assertSameError(clusterID, nodeID, oe, ne)
 	if oe != nil {
 		return nil, oe
 	}

@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -34,10 +33,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/leaktest"
 	"github.com/lni/goutils/random"
 	"github.com/lni/goutils/syncutil"
-	gvfs "github.com/lni/goutils/vfs"
 
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/config"
@@ -47,6 +46,7 @@ import (
 	"github.com/lni/dragonboat/v3/internal/logdb"
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
+	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/tests"
 	"github.com/lni/dragonboat/v3/internal/transport"
 	"github.com/lni/dragonboat/v3/internal/vfs"
@@ -154,7 +154,7 @@ func getTestExpertConfig(fs vfs.IFS) config.ExpertConfig {
 }
 
 func reportLeakedFD(fs vfs.IFS, t *testing.T) {
-	gvfs.ReportLeakedFD(fs, t)
+	vfs.ReportLeakedFD(fs, t)
 }
 
 func getTestNodeHostConfig(fs vfs.IFS) *config.NodeHostConfig {
@@ -347,12 +347,6 @@ func (t *testSysEventListener) SnapshotCompacted(info raftio.SnapshotInfo) {
 	t.snapshotCompacted = append(t.snapshotCompacted, info)
 }
 
-func (t *testSysEventListener) getSnapshotCompacted() []raftio.SnapshotInfo {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return copySnapshotInfo(t.snapshotCompacted)
-}
-
 func copyEntryInfo(info []raftio.EntryInfo) []raftio.EntryInfo {
 	return append([]raftio.EntryInfo{}, info...)
 }
@@ -420,7 +414,7 @@ type noopLogDB struct {
 
 func (n *noopLogDB) BinaryFormat() uint32                                      { return 0 }
 func (n *noopLogDB) Name() string                                              { return "noopLogDB" }
-func (n *noopLogDB) Close()                                                    {}
+func (n *noopLogDB) Close() error                                              { return nil }
 func (n *noopLogDB) HasNodeInfo(clusterID uint64, nodeID uint64) (bool, error) { return true, nil }
 func (n *noopLogDB) CreateNodeInfo(clusterID uint64, nodeID uint64) error      { return nil }
 func (n *noopLogDB) ListNodeInfo() ([]raftio.NodeInfo, error)                  { return nil, nil }
@@ -445,11 +439,10 @@ func (n *noopLogDB) CompactEntriesTo(clusterID uint64,
 	nodeID uint64, index uint64) (<-chan struct{}, error) {
 	return nil, nil
 }
-func (n *noopLogDB) RemoveNodeData(clusterID uint64, nodeID uint64) error               { return nil }
-func (n *noopLogDB) SaveSnapshots([]pb.Update) error                                    { return nil }
-func (n *noopLogDB) DeleteSnapshot(clusterID uint64, nodeID uint64, index uint64) error { return nil }
-func (n *noopLogDB) ListSnapshots(clusterID uint64, nodeID uint64, index uint64) ([]pb.Snapshot, error) {
-	return nil, nil
+func (n *noopLogDB) RemoveNodeData(clusterID uint64, nodeID uint64) error { return nil }
+func (n *noopLogDB) SaveSnapshots([]pb.Update) error                      { return nil }
+func (n *noopLogDB) GetSnapshot(clusterID uint64, nodeID uint64) (pb.Snapshot, error) {
+	return pb.Snapshot{}, nil
 }
 func (n *noopLogDB) ImportSnapshot(snapshot pb.Snapshot, nodeID uint64) error {
 	return nil
@@ -479,6 +472,7 @@ type testOption struct {
 	restartNodeHost      bool
 	noElection           bool
 	compressed           bool
+	fsErrorInjection     bool
 }
 
 func createSingleTestNode(t *testing.T, to *testOption, nh *NodeHost) {
@@ -534,12 +528,12 @@ func createSingleTestNode(t *testing.T, to *testOption, nh *NodeHost) {
 
 func runNodeHostTest(t *testing.T, to *testOption, fs vfs.IFS) {
 	func() {
-		defer leaktest.AfterTest(t)()
-		defer func() {
-			if err := fs.RemoveAll(singleNodeHostTestDir); err != nil {
-				t.Fatalf("%v", err)
-			}
-		}()
+		if !to.fsErrorInjection {
+			defer leaktest.AfterTest(t)()
+		}
+		// FIXME:
+		// the following RemoveAll call will fail on windows after running error
+		// injection tests as some pebble log files are not closed
 		_ = fs.RemoveAll(singleNodeHostTestDir)
 		if to.bt != nil {
 			to.bt()
@@ -560,7 +554,17 @@ func runNodeHostTest(t *testing.T, to *testOption, fs vfs.IFS) {
 		}
 		if !to.restartNodeHost {
 			defer func() {
-				nh.Stop()
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							if to.fsErrorInjection {
+								return
+							}
+							panicNow(r.(error))
+						}
+					}()
+					nh.Close()
+				}()
 				if to.at != nil {
 					to.at(nh)
 				}
@@ -574,13 +578,13 @@ func runNodeHostTest(t *testing.T, to *testOption, fs vfs.IFS) {
 			to.tf(nh)
 		}
 		if to.restartNodeHost {
-			nh.Stop()
+			nh.Close()
 			nh, err = NewNodeHost(*nhc)
 			if err != nil {
 				t.Fatalf("failed to create nodehost: %v", err)
 			}
 			defer func() {
-				nh.Stop()
+				nh.Close()
 				if to.at != nil {
 					to.at(nh)
 				}
@@ -689,11 +693,22 @@ func TestTCPTransportIsUsedByDefault(t *testing.T) {
 	runNodeHostTest(t, to, fs)
 }
 
+type noopTransportFactory struct{}
+
+func (noopTransportFactory) Create(cfg config.NodeHostConfig,
+	h raftio.MessageHandler, ch raftio.ChunkHandler) raftio.ITransport {
+	return transport.NewNOOPTransport(cfg, h, ch)
+}
+
+func (noopTransportFactory) Validate(string) bool {
+	return true
+}
+
 func TestTransportFactoryIsStillHonored(t *testing.T) {
 	fs := vfs.GetTestFS()
 	to := &testOption{
 		updateNodeHostConfig: func(nhc *config.NodeHostConfig) *config.NodeHostConfig {
-			nhc.RaftRPCFactory = transport.NewNOOPTransport
+			nhc.Expert.TransportFactory = noopTransportFactory{}
 			return nhc
 		},
 		tf: func(nh *NodeHost) {
@@ -852,12 +867,12 @@ func testAddressByNodeHostID(t *testing.T,
 	if err != nil {
 		t.Fatalf("failed to create nh, %v", err)
 	}
-	defer nh1.Stop()
+	defer nh1.Close()
 	nh2, err := NewNodeHost(nhc2)
 	if err != nil {
 		t.Fatalf("failed to create nh2, %v", err)
 	}
-	defer nh2.Stop()
+	defer nh2.Close()
 	peers := make(map[uint64]string)
 	if addressByNodeHostID {
 		peers[1] = testNodeHostID1
@@ -951,7 +966,7 @@ func TestGossipCanHandleDynamicRaftAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create nh, %v", err)
 	}
-	defer nh1.Stop()
+	defer nh1.Close()
 	nh2, err := NewNodeHost(nhc2)
 	if err != nil {
 		t.Fatalf("failed to create nh2, %v", err)
@@ -999,13 +1014,13 @@ func TestGossipCanHandleDynamicRaftAddress(t *testing.T) {
 		}
 	}
 	testProposal()
-	nh2.Stop()
+	nh2.Close()
 	nhc2.RaftAddress = nodeHostTestAddr3
 	nh2, err = NewNodeHost(nhc2)
 	if err != nil {
 		t.Fatalf("failed to restart nh2, %v", err)
 	}
-	defer nh2.Stop()
+	defer nh2.Close()
 	if nh2.ID() != nh2NodeHostID {
 		t.Fatalf("NodeHostID changed, got %s, want %s", nh2.ID(), nh2NodeHostID)
 	}
@@ -1205,7 +1220,7 @@ func singleConcurrentNodeHostTest(t *testing.T,
 			t.Fatalf("failed to create nodehost %v", err)
 		}
 		defer func() {
-			nh.Stop()
+			nh.Close()
 		}()
 		nhc := nh.NodeHostConfig()
 		waitForLeaderToBeElected(t, nh, 1)
@@ -1235,8 +1250,8 @@ func twoFakeDiskNodeHostTest(t *testing.T,
 			t.Fatalf("failed to create nodehost %v", err)
 		}
 		defer func() {
-			nh1.Stop()
-			nh2.Stop()
+			nh1.Close()
+			nh2.Close()
 		}()
 		tf(t, nh1, nh2)
 	}()
@@ -1369,8 +1384,8 @@ func rateLimitedTwoNodeHostTest(t *testing.T,
 			t.Fatalf("failed to create nodehost2 %v", err)
 		}
 		defer func() {
-			nh1.Stop()
-			nh2.Stop()
+			nh1.Close()
+			nh2.Close()
 		}()
 		tf(t, nh1, nh2, n1, n2)
 	}()
@@ -1638,7 +1653,7 @@ func TestInvalidContextDeadlineIsReported(t *testing.T) {
 			if err != ErrTimeoutTooSmall {
 				t.Errorf("failed to return ErrTimeoutTooSmall, %v", err)
 			}
-			err = nh.SyncRequestAddObserver(ctx, 1, 100, "a1.com:12345", 0)
+			err = nh.SyncRequestAddNonVoting(ctx, 1, 100, "a1.com:12345", 0)
 			if err != ErrTimeoutTooSmall {
 				t.Errorf("failed to return ErrTimeoutTooSmall, %v", err)
 			}
@@ -1673,7 +1688,7 @@ func TestErrClusterNotFoundCanBeReturned(t *testing.T) {
 			if err != ErrClusterNotFound {
 				t.Errorf("failed to return ErrClusterNotFound, %v", err)
 			}
-			_, err = nh.RequestAddObserver(1234, 10, "a1", 0, pto)
+			_, err = nh.RequestAddNonVoting(1234, 10, "a1", 0, pto)
 			if err != ErrClusterNotFound {
 				t.Errorf("failed to return ErrClusterNotFound, %v", err)
 			}
@@ -1792,13 +1807,13 @@ func TestSnapshotFilePayloadChecksumIsSaved(t *testing.T) {
 				if err != nil {
 					continue
 				}
-				snapshots, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+				ss, err := logdb.GetSnapshot(1, 1)
 				if err != nil {
 					t.Fatalf("failed to list snapshots")
 				}
-				if len(snapshots) > 0 {
+				if !pb.IsEmptySnapshot(ss) {
 					snapshotted = true
-					snapshot = snapshots[0]
+					snapshot = ss
 					break
 				}
 			}
@@ -1972,7 +1987,10 @@ func TestEntryCompression(t *testing.T) {
 			for _, e := range ents {
 				if e.Type == pb.EncodedEntry {
 					hasEncodedEntry = true
-					payload := rsm.GetPayload(e)
+					payload, err := rsm.GetPayload(e)
+					if err != nil {
+						t.Fatalf("failed to get payload %v", err)
+					}
 					if !bytes.Equal(payload, make([]byte, 1024)) {
 						t.Errorf("payload changed")
 					}
@@ -1980,6 +1998,43 @@ func TestEntryCompression(t *testing.T) {
 			}
 			if !hasEncodedEntry {
 				t.Errorf("failed to locate any encoded entry")
+			}
+		},
+	}
+	runNodeHostTest(t, to, fs)
+}
+
+func TestOrderedMembershipChange(t *testing.T) {
+	fs := vfs.GetTestFS()
+	to := &testOption{
+		defaultTestNode: true,
+		updateConfig: func(c *config.Config) *config.Config {
+			c.OrderedConfigChange = true
+			return c
+		},
+		tf: func(nh *NodeHost) {
+			pto := pto(nh)
+			{
+				ctx, cancel := context.WithTimeout(context.Background(), 2*pto)
+				defer cancel()
+				m, err := nh.SyncGetClusterMembership(ctx, 1)
+				if err != nil {
+					t.Fatalf("get membership failed, %v", err)
+				}
+				if err := nh.SyncRequestAddNode(ctx, 1, 2, "localhost:25000", m.ConfigChangeID+1); err == nil {
+					t.Fatalf("unexpectedly completed")
+				}
+			}
+			{
+				ctx, cancel := context.WithTimeout(context.Background(), 2*pto)
+				defer cancel()
+				m, err := nh.SyncGetClusterMembership(ctx, 1)
+				if err != nil {
+					t.Fatalf("get membership failed, %v", err)
+				}
+				if err := nh.SyncRequestAddNode(ctx, 1, 2, "localhost:25000", m.ConfigChangeID); err != nil {
+					t.Fatalf("failed to add node %v", err)
+				}
 			}
 		},
 	}
@@ -2029,7 +2084,7 @@ func TestSyncRequestAddNode(t *testing.T) {
 	runNodeHostTest(t, to, fs)
 }
 
-func TestSyncRequestAddObserver(t *testing.T) {
+func TestSyncRequestAddNonVoting(t *testing.T) {
 	fs := vfs.GetTestFS()
 	to := &testOption{
 		defaultTestNode: true,
@@ -2037,9 +2092,9 @@ func TestSyncRequestAddObserver(t *testing.T) {
 			pto := pto(nh)
 			ctx, cancel := context.WithTimeout(context.Background(), pto)
 			defer cancel()
-			err := nh.SyncRequestAddObserver(ctx, 1, 2, "localhost:25000", 0)
+			err := nh.SyncRequestAddNonVoting(ctx, 1, 2, "localhost:25000", 0)
 			if err != nil {
-				t.Errorf("failed to add observer %v", err)
+				t.Errorf("failed to add nonVoting %v", err)
 			}
 		},
 	}
@@ -2136,13 +2191,13 @@ func TestNodeHostNodeUserRead(t *testing.T) {
 	runNodeHostTest(t, to, fs)
 }
 
-func TestNodeHostAddObserverRemoveNode(t *testing.T) {
+func TestNodeHostAddNonVotingRemoveNode(t *testing.T) {
 	fs := vfs.GetTestFS()
 	to := &testOption{
 		defaultTestNode: true,
 		tf: func(nh *NodeHost) {
 			pto := pto(nh)
-			rs, err := nh.RequestAddObserver(1, 2, "localhost:25000", 0, pto)
+			rs, err := nh.RequestAddNonVoting(1, 2, "localhost:25000", 0, pto)
 			if err != nil {
 				t.Errorf("failed to add node %v", err)
 			}
@@ -2159,10 +2214,10 @@ func TestNodeHostAddObserverRemoveNode(t *testing.T) {
 			if len(membership.Nodes) != 1 || len(membership.Removed) != 0 {
 				t.Errorf("unexpected nodes/removed len")
 			}
-			if len(membership.Observers) != 1 {
+			if len(membership.NonVotings) != 1 {
 				t.Errorf("unexpected nodes len")
 			}
-			_, ok := membership.Observers[2]
+			_, ok := membership.NonVotings[2]
 			if !ok {
 				t.Errorf("node 2 not added")
 			}
@@ -2184,7 +2239,7 @@ func TestNodeHostAddObserverRemoveNode(t *testing.T) {
 			if len(membership.Nodes) != 1 || len(membership.Removed) != 1 {
 				t.Errorf("unexpected nodes/removed len")
 			}
-			if len(membership.Observers) != 0 {
+			if len(membership.NonVotings) != 0 {
 				t.Errorf("unexpected nodes len")
 			}
 			_, ok = membership.Removed[2]
@@ -2285,7 +2340,8 @@ func TestStaleReadOnUninitializedNodeReturnError(t *testing.T) {
 	runNodeHostTest(t, to, fs)
 }
 
-func testOnDiskStateMachineCanTakeDummySnapshot(t *testing.T, compressed bool, fs vfs.IFS) {
+func testOnDiskStateMachineCanTakeDummySnapshot(t *testing.T, compressed bool) {
+	fs := vfs.GetTestFS()
 	to := &testOption{
 		fakeDiskNode: true,
 		compressed:   compressed,
@@ -2307,13 +2363,13 @@ func testOnDiskStateMachineCanTakeDummySnapshot(t *testing.T, compressed bool, f
 				if err != nil {
 					continue
 				}
-				snapshots, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+				snapshot, err := logdb.GetSnapshot(1, 1)
 				if err != nil {
 					t.Fatalf("list snapshot failed %v", err)
 				}
-				if len(snapshots) > 0 {
+				if !pb.IsEmptySnapshot(snapshot) {
 					snapshotted = true
-					ss = snapshots[0]
+					ss = snapshot
 					if !ss.Dummy {
 						t.Fatalf("dummy snapshot is not recorded as dummy")
 					}
@@ -2341,13 +2397,9 @@ func testOnDiskStateMachineCanTakeDummySnapshot(t *testing.T, compressed bool, f
 			if fi.Size() != 1060 {
 				t.Fatalf("unexpected dummy snapshot file size %d", fi.Size())
 			}
-			reader, err := rsm.NewSnapshotReader(ss.Filepath, fs)
+			reader, h, err := rsm.NewSnapshotReader(ss.Filepath, fs)
 			if err != nil {
 				t.Fatalf("failed to read snapshot %v", err)
-			}
-			h, err := reader.GetHeader()
-			if err != nil {
-				t.Errorf("failed to get header")
 			}
 			// dummy snapshot is always not compressed
 			if h.CompressionType != config.NoCompression {
@@ -2371,9 +2423,8 @@ func testOnDiskStateMachineCanTakeDummySnapshot(t *testing.T, compressed bool, f
 }
 
 func TestOnDiskStateMachineCanTakeDummySnapshot(t *testing.T) {
-	fs := vfs.GetTestFS()
-	testOnDiskStateMachineCanTakeDummySnapshot(t, true, fs)
-	testOnDiskStateMachineCanTakeDummySnapshot(t, false, fs)
+	testOnDiskStateMachineCanTakeDummySnapshot(t, true)
+	testOnDiskStateMachineCanTakeDummySnapshot(t, false)
 }
 
 func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
@@ -2413,11 +2464,11 @@ func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			snapshots, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+			snapshot, err := logdb.GetSnapshot(1, 1)
 			if err != nil {
 				t.Fatalf("list snapshot failed %v", err)
 			}
-			if len(snapshots) >= 3 {
+			if !pb.IsEmptySnapshot(snapshot) {
 				snapshotted = true
 				break
 			} else if i%50 == 0 {
@@ -2455,49 +2506,53 @@ func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
 		if err := nh2.StartOnDiskCluster(nil, true, newSM2, rc); err != nil {
 			t.Fatalf("failed to start cluster %v", err)
 		}
-		snapshotted = false
+		ssIndex := uint64(0)
 		logdb = nh2.mu.logdb
 		waitForLeaderToBeElected(t, nh2, 1)
 		for i := uint64(2); i < 1000; i++ {
 			ctx, cancel := context.WithTimeout(context.Background(), pto)
 			_, err := nh2.SyncPropose(ctx, session, []byte("test-data"))
 			cancel()
+			plog.Infof("nh2 proposal result: %v", err)
 			if err != nil {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			snapshots, err := logdb.ListSnapshots(1, 2, math.MaxUint64)
+			ss, err := logdb.GetSnapshot(1, 2)
 			if err != nil {
 				t.Fatalf("list snapshot failed %v", err)
 			}
-			if len(snapshots) >= 3 {
-				snapshotted = true
+			if !pb.IsEmptySnapshot(ss) {
 				if !sm2.Recovered() {
 					t.Fatalf("not recovered")
 				}
 				if !sm1.Aborted() {
 					t.Fatalf("not aborted")
 				}
-				for _, ss := range snapshots {
-					if ss.OnDiskIndex == 0 {
-						t.Errorf("on disk index not recorded in ss")
-					}
-					shrunk, err := rsm.IsShrunkSnapshotFile(ss.Filepath, fs)
-					if err != nil {
-						t.Errorf("failed to check whether snapshot is shrunk %v", err)
-					}
-					if !shrunk {
-						t.Errorf("snapshot %d is not shrunk", ss.Index)
+				if ss.OnDiskIndex == 0 {
+					t.Errorf("on disk index not recorded in ss")
+				}
+				shrunk, err := rsm.IsShrunkSnapshotFile(ss.Filepath, fs)
+				if err != nil {
+					t.Errorf("failed to check whether snapshot is shrunk %v", err)
+				}
+				if !shrunk {
+					t.Errorf("snapshot %d is not shrunk", ss.Index)
+				}
+				if ssIndex == 0 {
+					ssIndex = ss.Index
+				} else {
+					if ssIndex != ss.Index {
+						break
 					}
 				}
-				break
 			} else if i%50 == 0 {
 				// see comments in testOnDiskStateMachineCanTakeDummySnapshot
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
-		if !snapshotted {
-			t.Fatalf("failed to take 3 snapshots")
+		if ssIndex == 0 {
+			t.Fatalf("failed to take 2 snapshots")
 		}
 		listener, ok := nh2.events.sys.ul.(*testSysEventListener)
 		if !ok {
@@ -2508,9 +2563,6 @@ func TestOnDiskSMCanStreamSnapshot(t *testing.T) {
 		}
 		if len(listener.getSnapshotRecovered()) == 0 {
 			t.Fatalf("failed to be notified for recovered snapshot")
-		}
-		if len(listener.getSnapshotCompacted()) == 0 {
-			t.Fatalf("snapshot compaction not notified")
 		}
 		if len(listener.getLogCompacted()) == 0 {
 			t.Fatalf("log compaction not notified")
@@ -2605,8 +2657,8 @@ func TestConcurrentStateMachineSaveSnapshot(t *testing.T) {
 					t.Errorf("unexpected state machine type")
 				}
 			}
-			if ci.IsObserver {
-				t.Errorf("unexpected IsObserver value")
+			if ci.IsNonVoting {
+				t.Errorf("unexpected IsNonVoting value")
 			}
 		}
 		result := make(map[uint64]struct{})
@@ -2659,8 +2711,8 @@ func TestRegularStateMachineDoesNotAllowConucrrentUpdate(t *testing.T) {
 					t.Errorf("unexpected state machine type")
 				}
 			}
-			if ci.IsObserver {
-				t.Errorf("unexpected IsObserver value")
+			if ci.IsNonVoting {
+				t.Errorf("unexpected IsNonVoting value")
 			}
 		}
 		stopper := syncutil.NewStopper()
@@ -2936,7 +2988,7 @@ func TestUpdateResultIsReturnedToCaller(t *testing.T) {
 	runNodeHostTest(t, to, fs)
 }
 
-func TestIsObserverIsReturnedWhenNodeIsObserver(t *testing.T) {
+func TestIsNonVotingIsReturnedWhenNodeIsNonVoting(t *testing.T) {
 	fs := vfs.GetTestFS()
 	tf := func(t *testing.T, nh1 *NodeHost, nh2 *NodeHost) {
 		rc := config.Config{
@@ -2955,7 +3007,7 @@ func TestIsObserverIsReturnedWhenNodeIsObserver(t *testing.T) {
 		peers := make(map[uint64]string)
 		peers[1] = nodeHostTestAddr1
 		if err := nh1.StartOnDiskCluster(peers, false, newSM, rc); err != nil {
-			t.Errorf("failed to start observer %v", err)
+			t.Errorf("failed to start nonVoting %v", err)
 		}
 		waitForLeaderToBeElected(t, nh1, 1)
 		rc = config.Config{
@@ -2963,7 +3015,7 @@ func TestIsObserverIsReturnedWhenNodeIsObserver(t *testing.T) {
 			NodeID:             2,
 			ElectionRTT:        3,
 			HeartbeatRTT:       1,
-			IsObserver:         true,
+			IsNonVoting:        true,
 			CheckQuorum:        true,
 			SnapshotEntries:    5,
 			CompactionOverhead: 2,
@@ -2972,13 +3024,13 @@ func TestIsObserverIsReturnedWhenNodeIsObserver(t *testing.T) {
 			return tests.NewFakeDiskSM(0)
 		}
 		pto := pto(nh1)
-		rs, err := nh1.RequestAddObserver(1, 2, nodeHostTestAddr2, 0, pto)
+		rs, err := nh1.RequestAddNonVoting(1, 2, nodeHostTestAddr2, 0, pto)
 		if err != nil {
-			t.Fatalf("failed to add observer %v", err)
+			t.Fatalf("failed to add nonVoting %v", err)
 		}
 		<-rs.ResultC()
 		if err := nh2.StartOnDiskCluster(nil, true, newSM2, rc); err != nil {
-			t.Errorf("failed to start observer %v", err)
+			t.Errorf("failed to start nonVoting %v", err)
 		}
 		for i := 0; i < 10000; i++ {
 			nhi := nh2.GetNodeHostInfo(DefaultNodeHostInfoOption)
@@ -2986,13 +3038,13 @@ func TestIsObserverIsReturnedWhenNodeIsObserver(t *testing.T) {
 				if ci.Pending {
 					continue
 				}
-				if ci.IsObserver && ci.NodeID == 2 {
+				if ci.IsNonVoting && ci.NodeID == 2 {
 					return
 				}
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		t.Errorf("failed to get is observer flag")
+		t.Errorf("failed to get is nonVoting flag")
 	}
 	twoFakeDiskNodeHostTest(t, tf, fs)
 }
@@ -3205,25 +3257,21 @@ func TestSnapshotCanBeRequested(t *testing.T) {
 				t.Errorf("failed to complete the requested snapshot")
 			}
 			logdb := nh.mu.logdb
-			snapshots, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+			snapshot, err := logdb.GetSnapshot(1, 1)
 			if err != nil {
 				t.Fatalf("%v", err)
 			}
-			if len(snapshots) == 0 {
+			if pb.IsEmptySnapshot(snapshot) {
 				t.Fatalf("failed to save snapshots")
 			}
-			if snapshots[0].Index != index {
+			if snapshot.Index != index {
 				t.Errorf("unexpected index value")
 			}
-			reader, err := rsm.NewSnapshotReader(snapshots[0].Filepath, fs)
+			reader, header, err := rsm.NewSnapshotReader(snapshot.Filepath, fs)
 			if err != nil {
 				t.Fatalf("failed to new snapshot reader %v", err)
 			}
 			defer reader.Close()
-			header, err := reader.GetHeader()
-			if err != nil {
-				t.Fatalf("failed to get header %v", err)
-			}
 			if rsm.SSVersion(header.Version) != rsm.V2 {
 				t.Errorf("unexpected snapshot version")
 			}
@@ -3416,11 +3464,11 @@ func TestRemoveNodeDataRemovesAllNodeData(t *testing.T) {
 				t.Fatalf("failed to stop cluster %v", err)
 			}
 			logdb := nh.mu.logdb
-			snapshots, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+			snapshot, err := logdb.GetSnapshot(1, 1)
 			if err != nil {
 				t.Fatalf("%v", err)
 			}
-			if len(snapshots) == 0 {
+			if pb.IsEmptySnapshot(snapshot) {
 				t.Fatalf("failed to save snapshots")
 			}
 			snapshotDir := nh.env.GetSnapshotDir(nh.nhConfig.GetDeploymentID(), 1, 1)
@@ -3493,7 +3541,7 @@ func TestRemoveNodeDataRemovesAllNodeData(t *testing.T) {
 				}
 			}
 			bs, err := logdb.GetBootstrapInfo(1, 1)
-			if err != raftio.ErrNoBootstrapInfo {
+			if !errors.Is(err, raftio.ErrNoBootstrapInfo) {
 				t.Fatalf("failed to delete bootstrap %v", err)
 			}
 			if !reflect.DeepEqual(bs, pb.Bootstrap{}) {
@@ -3507,15 +3555,15 @@ func TestRemoveNodeDataRemovesAllNodeData(t *testing.T) {
 			if len(ents) != 0 || sz != 0 {
 				t.Fatalf("entry returned")
 			}
-			snapshots, err = logdb.ListSnapshots(1, 1, math.MaxUint64)
+			snapshot, err = logdb.GetSnapshot(1, 1)
 			if err != nil {
 				t.Fatalf("%v", err)
 			}
-			if len(snapshots) != 0 {
+			if !pb.IsEmptySnapshot(snapshot) {
 				t.Fatalf("snapshot not deleted")
 			}
 			_, err = logdb.ReadRaftState(1, 1, 1)
-			if err != raftio.ErrNoSavedLog {
+			if !errors.Is(err, raftio.ErrNoSavedLog) {
 				t.Fatalf("raft state not deleted %v", err)
 			}
 			sysop, err := nh.RequestCompaction(1, 1)
@@ -3569,12 +3617,12 @@ func TestSnapshotCanBeExported(t *testing.T) {
 			}
 			index = v.SnapshotIndex()
 			logdb := nh.mu.logdb
-			snapshots, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+			snapshot, err := logdb.GetSnapshot(1, 1)
 			if err != nil {
 				t.Fatalf("%v", err)
 			}
 			// exported snapshot is not managed by the system
-			if len(snapshots) != 0 {
+			if !pb.IsEmptySnapshot(snapshot) {
 				t.Fatalf("snapshot record unexpectedly inserted into the system")
 			}
 			snapshotDir := fmt.Sprintf("snapshot-%016X", index)
@@ -3681,11 +3729,11 @@ func TestOnDiskStateMachineCanExportSnapshot(t *testing.T) {
 				t.Fatalf("never aborted")
 			}
 			logdb := nh.mu.logdb
-			snapshots, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+			snapshot, err := logdb.GetSnapshot(1, 1)
 			if err != nil {
 				t.Fatalf("%v", err)
 			}
-			if len(snapshots) != 0 {
+			if !pb.IsEmptySnapshot(snapshot) {
 				t.Fatalf("snapshot record unexpectedly inserted into the system")
 			}
 			snapshotDir := fmt.Sprintf("snapshot-%016X", index)
@@ -3766,7 +3814,7 @@ func testImportedSnapshotIsAlwaysRestored(t *testing.T,
 		}
 		waitForLeaderToBeElected(t, nh, 1)
 		makeProposals := func(nn *NodeHost) {
-			session := nh.GetNoOPSession(1)
+			session := nn.GetNoOPSession(1)
 			for i := 0; i < 16; i++ {
 				ctx, cancel := context.WithTimeout(context.Background(), pto)
 				_, err := nn.SyncPropose(ctx, session, []byte("test-data"))
@@ -3827,7 +3875,7 @@ func testImportedSnapshotIsAlwaysRestored(t *testing.T,
 		if err := nh.SyncRequestAddNode(ctx, 1, 2, "noidea:8080", 0); err != nil {
 			t.Fatalf("failed to add node %v", err)
 		}
-		nh.Stop()
+		nh.Close()
 		snapshotDir := fmt.Sprintf("snapshot-%016X", index)
 		dir := fs.PathJoin(sspath, snapshotDir)
 		members := make(map[uint64]string)
@@ -3850,7 +3898,7 @@ func testImportedSnapshotIsAlwaysRestored(t *testing.T,
 			if err != nil {
 				t.Fatalf("failed to create node host %v", err)
 			}
-			defer rnh.Stop()
+			defer rnh.Close()
 			rnewSM := func(uint64, uint64) sm.IOnDiskStateMachine {
 				return tests.NewSimDiskSM(applied)
 			}
@@ -3899,7 +3947,7 @@ func TestClusterWithoutQuorumCanBeRestoreByImportingSnapshot(t *testing.T) {
 		rc := config.Config{
 			ClusterID:          1,
 			NodeID:             1,
-			ElectionRTT:        3,
+			ElectionRTT:        10,
 			HeartbeatRTT:       1,
 			CheckQuorum:        true,
 			SnapshotEntries:    5,
@@ -3948,8 +3996,8 @@ func TestClusterWithoutQuorumCanBeRestoreByImportingSnapshot(t *testing.T) {
 			}
 		}()
 		defer once.Do(func() {
-			nh1.Stop()
-			nh2.Stop()
+			nh1.Close()
+			nh2.Close()
 		})
 		session := nh1.GetNoOPSession(1)
 		mkproposal := func(nh *NodeHost) {
@@ -4004,8 +4052,8 @@ func TestClusterWithoutQuorumCanBeRestoreByImportingSnapshot(t *testing.T) {
 		members[1] = nhc1.RaftAddress
 		members[10] = nhc2.RaftAddress
 		once.Do(func() {
-			nh1.Stop()
-			nh2.Stop()
+			nh1.Close()
+			nh2.Close()
 		})
 		if err := tools.ImportSnapshot(nhc1, dir, members, 1); err != nil {
 			t.Fatalf("failed to import snapshot %v", err)
@@ -4022,8 +4070,8 @@ func TestClusterWithoutQuorumCanBeRestoreByImportingSnapshot(t *testing.T) {
 			t.Fatalf("failed to create node host %v", err)
 		}
 		defer func() {
-			rnh1.Stop()
-			rnh2.Stop()
+			rnh1.Close()
+			rnh2.Close()
 		}()
 		if err := rnh1.StartOnDiskCluster(nil, false, newSM, rc); err != nil {
 			t.Fatalf("failed to start cluster %v", err)
@@ -4069,8 +4117,9 @@ func (s *testSink2) Receive(chunk pb.Chunk) (bool, bool) {
 	return true, false
 }
 
-func (s *testSink2) Stop() {
+func (s *testSink2) Close() error {
 	s.Receive(pb.Chunk{ChunkCount: pb.PoisonChunkCount})
+	return nil
 }
 
 func (s *testSink2) ClusterID() uint64 {
@@ -4095,8 +4144,9 @@ func (s *dataCorruptionSink) Receive(chunk pb.Chunk) (bool, bool) {
 	return true, false
 }
 
-func (s *dataCorruptionSink) Stop() {
+func (s *dataCorruptionSink) Close() error {
 	s.Receive(pb.Chunk{ChunkCount: pb.PoisonChunkCount})
+	return nil
 }
 
 func (s *dataCorruptionSink) ClusterID() uint64 {
@@ -4205,14 +4255,11 @@ func TestChunkWriterOutputCanBeHandledByChunk(t *testing.T) {
 	}
 	fp := fs.PathJoin(testSnapshotDir,
 		"snapshot-00000000000003E8", "snapshot-00000000000003E8.gbsnap")
-	reader, err := rsm.NewSnapshotReader(fp, fs)
+	reader, _, err := rsm.NewSnapshotReader(fp, fs)
 	if err != nil {
 		t.Fatalf("failed to get a snapshot reader %v", err)
 	}
 	defer reader.Close()
-	if _, err = reader.GetHeader(); err != nil {
-		t.Fatalf("failed to get header %v", err)
-	}
 	got := make([]byte, 0)
 	buf := make([]byte, 1024*256)
 	for {
@@ -4289,7 +4336,7 @@ func TestNodeHostFileLock(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to create nodehost %v", err)
 			}
-			defer nh.Stop()
+			defer nh.Close()
 			out, err := spawn(os.Args[0])
 			if err == nil {
 				t.Fatalf("file lock didn't prevent the second nh to start, %s", out)
@@ -4304,11 +4351,11 @@ func TestNodeHostFileLock(t *testing.T) {
 				t.Fatalf("returned ErrLockDirectory")
 			}
 			if err == nil {
-				defer cnh.Stop()
+				defer cnh.Close()
 			}
 		}
 	}
-	runNodeHostTestDC(t, tf, false, fs)
+	runNodeHostTestDC(t, tf, !*spawnChild, fs)
 }
 
 type testLogDBFactory2 struct {
@@ -4330,11 +4377,11 @@ func TestNodeHostReturnsErrLogDBBrokenChangeWhenLogDBTypeChanges(t *testing.T) {
 	fs := vfs.GetTestFS()
 	bff := func(config config.NodeHostConfig, cb config.LogDBCallback,
 		dirs []string, lldirs []string) (raftio.ILogDB, error) {
-		return logdb.NewDefaultBatchedLogDB(config, cb, dirs, lldirs, fs)
+		return logdb.NewDefaultBatchedLogDB(config, cb, dirs, lldirs)
 	}
 	nff := func(config config.NodeHostConfig, cb config.LogDBCallback,
 		dirs []string, lldirs []string) (raftio.ILogDB, error) {
-		return logdb.NewDefaultLogDB(config, cb, dirs, lldirs, fs)
+		return logdb.NewDefaultLogDB(config, cb, dirs, lldirs)
 	}
 	to := &testOption{
 		at: func(*NodeHost) {
@@ -4357,11 +4404,11 @@ func TestNodeHostByDefaultUsePlainEntryLogDB(t *testing.T) {
 	fs := vfs.GetTestFS()
 	bff := func(config config.NodeHostConfig, cb config.LogDBCallback,
 		dirs []string, lldirs []string) (raftio.ILogDB, error) {
-		return logdb.NewDefaultBatchedLogDB(config, cb, dirs, lldirs, fs)
+		return logdb.NewDefaultBatchedLogDB(config, cb, dirs, lldirs)
 	}
 	nff := func(config config.NodeHostConfig, cb config.LogDBCallback,
 		dirs []string, lldirs []string) (raftio.ILogDB, error) {
-		return logdb.NewDefaultLogDB(config, cb, dirs, lldirs, fs)
+		return logdb.NewDefaultLogDB(config, cb, dirs, lldirs)
 	}
 	to := &testOption{
 		updateNodeHostConfig: func(c *config.NodeHostConfig) *config.NodeHostConfig {
@@ -4384,11 +4431,11 @@ func TestNodeHostByDefaultChecksWhetherToUseBatchedLogDB(t *testing.T) {
 	fs := vfs.GetTestFS()
 	bff := func(config config.NodeHostConfig, cb config.LogDBCallback,
 		dirs []string, lldirs []string) (raftio.ILogDB, error) {
-		return logdb.NewDefaultBatchedLogDB(config, cb, dirs, lldirs, fs)
+		return logdb.NewDefaultBatchedLogDB(config, cb, dirs, lldirs)
 	}
 	nff := func(config config.NodeHostConfig, cb config.LogDBCallback,
 		dirs []string, lldirs []string) (raftio.ILogDB, error) {
-		return logdb.NewDefaultLogDB(config, cb, dirs, lldirs, fs)
+		return logdb.NewDefaultLogDB(config, cb, dirs, lldirs)
 	}
 	to := &testOption{
 		updateNodeHostConfig: func(c *config.NodeHostConfig) *config.NodeHostConfig {
@@ -4414,7 +4461,7 @@ func TestNodeHostByDefaultChecksWhetherToUseBatchedLogDB(t *testing.T) {
 			if nh, err := NewNodeHost(*nhc); err != nil {
 				t.Errorf("failed to create node host")
 			} else {
-				nh.Stop()
+				nh.Close()
 			}
 		},
 	}
@@ -4691,6 +4738,11 @@ func TestV2DataCanBeHandled(t *testing.T) {
 			return c
 		},
 		tf: func(nh *NodeHost) {
+			name := nh.mu.logdb.Name()
+			if name != "sharded-pebble" && name != "sharded-rocksdb" {
+				// v2-rocksdb-batched.tar.bz2 contains rocksdb format data
+				t.Skip("skipped as not using rocksdb")
+			}
 			logdb := nh.mu.logdb
 			rs, err := logdb.ReadRaftState(2, 1, 0)
 			if err != nil {
@@ -4720,14 +4772,14 @@ func TestSnapshotCanBeCompressed(t *testing.T) {
 				t.Fatalf("failed to request snapshot %v", err)
 			}
 			logdb := nh.mu.logdb
-			ssList, err := logdb.ListSnapshots(1, 1, math.MaxUint64)
+			ss, err := logdb.GetSnapshot(1, 1)
 			if err != nil {
 				t.Fatalf("failed to list snapshots: %v", err)
 			}
-			if len(ssList) != 1 {
-				t.Fatalf("failed to get snapshot rec, %d", len(ssList))
+			if pb.IsEmptySnapshot(ss) {
+				t.Fatalf("failed to get snapshot rec")
 			}
-			fi, err := fs.Stat(ssList[0].Filepath)
+			fi, err := fs.Stat(ss.Filepath)
 			if err != nil {
 				t.Fatalf("failed to get file path %v", err)
 			}
@@ -4775,7 +4827,7 @@ func testWitnessIO(t *testing.T,
 		if err != nil {
 			t.Fatalf("failed to create node host %v", err)
 		}
-		defer nh1.Stop()
+		defer nh1.Close()
 		newSM := func(uint64, uint64) sm.IOnDiskStateMachine {
 			return tests.NewSimDiskSM(0)
 		}
@@ -4809,12 +4861,12 @@ func testWitnessIO(t *testing.T,
 		if err != nil {
 			t.Fatalf("failed to create node host %v", err)
 		}
-		defer nh2.Stop()
+		defer nh2.Close()
 		witness := tests.NewSimDiskSM(0)
 		newWitness := func(uint64, uint64) sm.IOnDiskStateMachine {
 			return witness
 		}
-		if err := nh2.StartOnDiskCluster(peers, false, newWitness, rc2); err != nil {
+		if err := nh2.StartOnDiskCluster(nil, true, newWitness, rc2); err != nil {
 			t.Fatalf("failed to start cluster %v", err)
 		}
 		waitForLeaderToBeElected(t, nh2, 1)
@@ -4830,17 +4882,15 @@ func TestWitnessSnapshotIsCorrectlyHandled(t *testing.T) {
 			if witness.GetRecovered() > 0 {
 				t.Fatalf("unexpected recovered count %d", witness.GetRecovered())
 			}
-			snapshots, err := nh2.mu.logdb.ListSnapshots(1, 2, math.MaxUint64)
+			snapshot, err := nh2.mu.logdb.GetSnapshot(1, 2)
 			if err != nil {
 				t.Fatalf("%v", err)
 			}
-			if len(snapshots) == 0 {
+			if pb.IsEmptySnapshot(snapshot) {
 				time.Sleep(100 * time.Millisecond)
 			} else {
-				for _, ss := range snapshots {
-					if !ss.Witness {
-						t.Errorf("not a witness snapshot")
-					}
+				if !snapshot.Witness {
+					t.Errorf("not a witness snapshot")
 				}
 				return
 			}
@@ -4888,8 +4938,8 @@ func TestWitnessCanNotInitiateIORequest(t *testing.T) {
 		if _, err := nh2.RequestDeleteNode(1, 3, 0, pto); err != ErrInvalidOperation {
 			t.Fatalf("delete node not rejected on witness")
 		}
-		if _, err := nh2.RequestAddObserver(1, 3, "a3.com:12345", 0, pto); err != ErrInvalidOperation {
-			t.Fatalf("add observer not rejected on witness")
+		if _, err := nh2.RequestAddNonVoting(1, 3, "a3.com:12345", 0, pto); err != ErrInvalidOperation {
+			t.Fatalf("add nonVoting not rejected on witness")
 		}
 		if _, err := nh2.RequestAddWitness(1, 3, "a3.com:12345", 0, pto); err != ErrInvalidOperation {
 			t.Fatalf("add witness not rejected on witness")
@@ -4954,7 +5004,8 @@ func testIOErrorIsHandled(t *testing.T, op vfs.Op) {
 	inj := vfs.OnIndex(-1, op)
 	fs := vfs.Wrap(vfs.GetTestFS(), inj)
 	to := &testOption{
-		defaultTestNode: true,
+		fsErrorInjection: true,
+		defaultTestNode:  true,
 		tf: func(nh *NodeHost) {
 			inj.SetIndex(0)
 			pto := pto(nh)
@@ -5126,7 +5177,7 @@ func TestUsingClosedNodeHostIsNotAllowed(t *testing.T) {
 			if err := nh.SyncRequestAddNode(ctx, 1, 1, "", 0); err != ErrClosed {
 				t.Errorf("failed to return ErrClosed")
 			}
-			if err := nh.SyncRequestAddObserver(ctx, 1, 1, "", 0); err != ErrClosed {
+			if err := nh.SyncRequestAddNonVoting(ctx, 1, 1, "", 0); err != ErrClosed {
 				t.Errorf("failed to return ErrClosed")
 			}
 			if err := nh.SyncRequestAddWitness(ctx, 1, 1, "", 0); err != ErrClosed {
@@ -5138,7 +5189,7 @@ func TestUsingClosedNodeHostIsNotAllowed(t *testing.T) {
 			if _, err := nh.RequestAddNode(1, 1, "", 0, time.Second); err != ErrClosed {
 				t.Errorf("failed to return ErrClosed")
 			}
-			if _, err := nh.RequestAddObserver(1, 1, "", 0, time.Second); err != ErrClosed {
+			if _, err := nh.RequestAddNonVoting(1, 1, "", 0, time.Second); err != ErrClosed {
 				t.Errorf("failed to return ErrClosed")
 			}
 			if _, err := nh.RequestAddWitness(1, 1, "", 0, time.Second); err != ErrClosed {
@@ -5197,7 +5248,7 @@ func TestContextDeadlineIsChecked(t *testing.T) {
 			if err := nh.SyncRequestAddNode(ctx, 1, 2, "", 0); err != ErrDeadlineNotSet {
 				t.Errorf("ctx deadline not checked")
 			}
-			if err := nh.SyncRequestAddObserver(ctx, 1, 2, "", 0); err != ErrDeadlineNotSet {
+			if err := nh.SyncRequestAddNonVoting(ctx, 1, 2, "", 0); err != ErrDeadlineNotSet {
 				t.Errorf("ctx deadline not checked")
 			}
 			if err := nh.SyncRequestAddWitness(ctx, 1, 2, "", 0); err != ErrDeadlineNotSet {
@@ -5231,7 +5282,11 @@ func TestHandleSnapshotStatus(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	nh := &NodeHost{stopper: syncutil.NewStopper()}
 	engine := newExecEngine(nh, config.GetDefaultEngineConfig(), false, false, nil, nil)
-	defer engine.stop()
+	defer func() {
+		if err := engine.close(); err != nil {
+			t.Fatalf("failed to close engine %v", err)
+		}
+	}()
 	nh.engine = engine
 	nh.events.sys = newSysEventListener(nil, nh.stopper.ShouldStop())
 	h := messageHandler{nh: nh}
@@ -5239,11 +5294,14 @@ func TestHandleSnapshotStatus(t *testing.T) {
 	node := &node{clusterID: 1, nodeID: 1, mq: mq}
 	h.nh.mu.clusters.Store(uint64(1), node)
 	h.HandleSnapshotStatus(1, 2, true)
+	for i := uint64(0); i <= streamPushDelayTick; i++ {
+		node.mq.Tick()
+	}
 	msgs := node.mq.Get()
 	if len(msgs) != 1 {
 		t.Fatalf("no msg")
 	}
-	if msgs[0].Type != pb.SnapshotStatus || !msgs[0].Reject || msgs[0].Hint != streamPushDelayTick {
+	if msgs[0].Type != pb.SnapshotStatus || !msgs[0].Reject {
 		t.Fatalf("unexpected message")
 	}
 }
@@ -5252,7 +5310,11 @@ func TestSnapshotReceivedMessageCanBeConverted(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	nh := &NodeHost{stopper: syncutil.NewStopper()}
 	engine := newExecEngine(nh, config.GetDefaultEngineConfig(), false, false, nil, nil)
-	defer engine.stop()
+	defer func() {
+		if err := engine.close(); err != nil {
+			t.Fatalf("failed to close engine %v", err)
+		}
+	}()
 	nh.engine = engine
 	nh.events.sys = newSysEventListener(nil, nh.stopper.ShouldStop())
 	h := messageHandler{nh: nh}
@@ -5266,11 +5328,14 @@ func TestSnapshotReceivedMessageCanBeConverted(t *testing.T) {
 	if sc != 0 || mc != 1 {
 		t.Errorf("failed to handle message batch")
 	}
+	for i := uint64(0); i <= streamConfirmedDelayTick; i++ {
+		node.mq.Tick()
+	}
 	msgs := node.mq.Get()
 	if len(msgs) != 1 {
 		t.Fatalf("no msg")
 	}
-	if msgs[0].Type != pb.SnapshotStatus || msgs[0].Reject || msgs[0].Hint != streamConfirmedDelayTick {
+	if msgs[0].Type != pb.SnapshotStatus || msgs[0].Reject {
 		t.Fatalf("unexpected message")
 	}
 }
@@ -5279,7 +5344,11 @@ func TestIncorrectlyRoutedMessagesAreIgnored(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	nh := &NodeHost{stopper: syncutil.NewStopper()}
 	engine := newExecEngine(nh, config.GetDefaultEngineConfig(), false, false, nil, nil)
-	defer engine.stop()
+	defer func() {
+		if err := engine.close(); err != nil {
+			t.Fatalf("failed to close engine %v", err)
+		}
+	}()
 	nh.engine = engine
 	nh.events.sys = newSysEventListener(nil, nh.stopper.ShouldStop())
 	h := messageHandler{nh: nh}
@@ -5375,4 +5444,168 @@ func TestBootstrapInfoIsValidated(t *testing.T) {
 		},
 	}
 	runNodeHostTest(t, to, fs)
+}
+
+// slow tests
+
+type stressRSM struct{}
+
+func (s *stressRSM) Update([]byte) (sm.Result, error) {
+	plog.Infof("updated")
+	return sm.Result{}, nil
+}
+
+func (s *stressRSM) Lookup(interface{}) (interface{}, error) {
+	return nil, nil
+}
+
+func (s *stressRSM) SaveSnapshot(w io.Writer,
+	f sm.ISnapshotFileCollection, c <-chan struct{}) error {
+	data := make([]byte, settings.SnapshotChunkSize*3)
+	_, err := w.Write(data)
+	return err
+}
+
+func (s *stressRSM) RecoverFromSnapshot(r io.Reader,
+	f []sm.SnapshotFile, c <-chan struct{}) error {
+	plog.Infof("RecoverFromSnapshot called")
+	data := make([]byte, settings.SnapshotChunkSize*3)
+	n, err := io.ReadFull(r, data)
+	if uint64(n) != settings.SnapshotChunkSize*3 {
+		return errors.New("unexpected size")
+	}
+	return err
+}
+
+func (s *stressRSM) Close() error {
+	return nil
+}
+
+// this test takes around 6 minutes on mbp and 30 seconds on a linux box with
+// proper SSD
+func TestSlowTestStressedSnapshotWorker(t *testing.T) {
+	if len(os.Getenv("SLOW_TEST")) == 0 {
+		t.Skip("skipped TestSlowTestStressedSnapshotWorker, SLOW_TEST not set")
+	}
+	fs := vfs.GetTestFS()
+	if err := fs.RemoveAll(singleNodeHostTestDir); err != nil {
+		t.Fatalf("%v", err)
+	}
+	defer func() {
+		if err := fs.RemoveAll(singleNodeHostTestDir); err != nil {
+			t.Fatalf("%v", err)
+		}
+	}()
+	nh1dir := fs.PathJoin(singleNodeHostTestDir, "nh1")
+	nh2dir := fs.PathJoin(singleNodeHostTestDir, "nh2")
+	rc := config.Config{
+		ClusterID:          1,
+		NodeID:             1,
+		ElectionRTT:        10,
+		HeartbeatRTT:       1,
+		CheckQuorum:        true,
+		SnapshotEntries:    5,
+		CompactionOverhead: 1,
+	}
+	peers := make(map[uint64]string)
+	peers[1] = nodeHostTestAddr1
+	nhc1 := config.NodeHostConfig{
+		WALDir:         nh1dir,
+		NodeHostDir:    nh1dir,
+		RTTMillisecond: 5 * getRTTMillisecond(fs, nh1dir),
+		RaftAddress:    nodeHostTestAddr1,
+		Expert:         getTestExpertConfig(fs),
+	}
+	nh1, err := NewNodeHost(nhc1)
+	if err != nil {
+		t.Fatalf("failed to create node host %v", err)
+	}
+	defer nh1.Close()
+	newRSM := func(uint64, uint64) sm.IStateMachine {
+		return &stressRSM{}
+	}
+	for i := uint64(1); i <= uint64(96); i++ {
+		rc.ClusterID = i
+		if err := nh1.StartCluster(peers, false, newRSM, rc); err != nil {
+			t.Fatalf("failed to start cluster %v", err)
+		}
+		cs := nh1.GetNoOPSession(i)
+		total := 20
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, err := nh1.SyncPropose(ctx, cs, make([]byte, 1))
+			cancel()
+			if err == ErrTimeout || err == ErrClusterNotReady {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			total--
+			if total == 0 {
+				break
+			}
+		}
+	}
+	// add another node
+	for i := uint64(1); i <= uint64(96); i++ {
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err := nh1.SyncRequestAddNode(ctx, i, 2, nodeHostTestAddr2, 0)
+			cancel()
+			if err != nil {
+				if err == ErrTimeout || err == ErrClusterNotReady {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				} else {
+					t.Fatalf("failed to add node %v", err)
+				}
+			} else {
+				break
+			}
+		}
+	}
+	plog.Infof("all nodes added")
+	nhc2 := config.NodeHostConfig{
+		WALDir:         nh2dir,
+		NodeHostDir:    nh2dir,
+		RTTMillisecond: 5 * getRTTMillisecond(fs, nh2dir),
+		RaftAddress:    nodeHostTestAddr2,
+		Expert:         getTestExpertConfig(fs),
+	}
+	nh2, err := NewNodeHost(nhc2)
+	if err != nil {
+		t.Fatalf("failed to create node host 2 %v", err)
+	}
+	// start new nodes
+	defer nh2.Close()
+	for i := uint64(1); i <= uint64(96); i++ {
+		rc.ClusterID = i
+		rc.NodeID = 2
+		peers := make(map[uint64]string)
+		if err := nh2.StartCluster(peers, true, newRSM, rc); err != nil {
+			t.Fatalf("failed to start cluster %v", err)
+		}
+	}
+	for i := uint64(1); i <= uint64(96); i++ {
+		cs := nh2.GetNoOPSession(i)
+		total := 1000
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, err := nh2.SyncPropose(ctx, cs, make([]byte, 1))
+			cancel()
+			if err != nil {
+				if err == ErrTimeout || err == ErrClusterNotReady {
+					total--
+					if total == 0 {
+						t.Fatalf("failed to make proposal on cluster %d", i)
+					}
+					time.Sleep(100 * time.Millisecond)
+					continue
+				} else {
+					t.Fatalf("failed to make proposal %v", err)
+				}
+			} else {
+				break
+			}
+		}
+	}
 }

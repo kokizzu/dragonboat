@@ -17,19 +17,19 @@ package dragonboat
 import (
 	"crypto/sha512"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/random"
 
 	"github.com/lni/dragonboat/v3/client"
 	"github.com/lni/dragonboat/v3/config"
+	"github.com/lni/dragonboat/v3/internal/fileutil"
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/logger"
@@ -90,19 +90,19 @@ var (
 var (
 	// ErrBadKey indicates that the key is bad, retry the request is recommended.
 	//
-	// Depreciated: ErrBadKey is no longer used.
+	// Deprecated: ErrBadKey is no longer used.
 	ErrBadKey = errors.New("bad key try again later")
 	// ErrPendingLeaderTransferExist has been depredicated, use ErrSystemBusy.
 	//
-	// Depreciated: ErrPendingLeaderTransferExist is depreciated.
+	// Deprecated: ErrPendingLeaderTransferExist is deprecated.
 	ErrPendingLeaderTransferExist = ErrSystemBusy
 	// ErrPendingConfigChangeExist has been deprecicated, use ErrSystemBusy.
 	//
-	// Depreciated: ErrPendingConfigChangeExist is depreciated.
+	// Deprecated: ErrPendingConfigChangeExist is deprecated.
 	ErrPendingConfigChangeExist = ErrSystemBusy
-	// ErrPendingSnapshotRequestExist has been depreciated, use ErrSystemBusy.
+	// ErrPendingSnapshotRequestExist has been deprecated, use ErrSystemBusy.
 	//
-	// Depreciated: ErrPendingSnapshotRequestExist is depreciated.
+	// Deprecated: ErrPendingSnapshotRequestExist is deprecated.
 	ErrPendingSnapshotRequestExist = ErrSystemBusy
 )
 
@@ -110,12 +110,12 @@ var (
 // is a temporary error that worth to be retried later with the exact same
 // input, potentially on a more suitable NodeHost instance.
 func IsTempError(err error) bool {
-	return err == ErrSystemBusy ||
-		err == ErrClusterClosed ||
-		err == ErrClusterNotInitialized ||
-		err == ErrClusterNotReady ||
-		err == ErrTimeout ||
-		err == ErrClosed
+	return errors.Is(err, ErrSystemBusy) ||
+		errors.Is(err, ErrClusterClosed) ||
+		errors.Is(err, ErrClusterNotInitialized) ||
+		errors.Is(err, ErrClusterNotReady) ||
+		errors.Is(err, ErrTimeout) ||
+		errors.Is(err, ErrClosed)
 }
 
 // RequestResultCode is the result code returned to the client to indicate the
@@ -336,6 +336,16 @@ func (r *RequestState) ResultC() chan RequestResult {
 		return r.aggrC
 	}
 	r.aggrC = make(chan RequestResult, 2)
+	tryBridgeCommittedC := func() {
+		select {
+		case cn := <-r.committedC:
+			if cn.code != requestCommitted {
+				plog.Panicf("unexpected requestResult, %s", cn.code)
+			}
+			r.aggrC <- cn
+		default:
+		}
+	}
 	go func() {
 		if r.testErr != nil {
 			defer func() {
@@ -363,14 +373,20 @@ func (r *RequestState) ResultC() chan RequestResult {
 			r.aggrC <- cc
 		case cc := <-r.CompletedC:
 			if cc.Aborted() {
+				// this select is to make the test TestResultCCanReceiveRequestResults
+				// easier to implement for the input
+				// {true, true, requestAborted, true}
+				tryBridgeCommittedC()
 				plog.Panicf("requestAborted sent to CompletedC")
 			}
 			if cc.code == requestCommitted {
+				tryBridgeCommittedC()
 				plog.Panicf("requestCommitted sent to CompletedC")
 			}
 			select {
 			case ccn := <-r.committedC:
 				if cc.Dropped() {
+					r.aggrC <- ccn
 					plog.Panicf("applied entry dropped")
 				}
 				r.aggrC <- ccn
@@ -535,8 +551,8 @@ type pendingLeaderTransfer struct {
 	leaderTransferC chan uint64
 }
 
-func newPendingLeaderTransfer() *pendingLeaderTransfer {
-	return &pendingLeaderTransfer{
+func newPendingLeaderTransfer() pendingLeaderTransfer {
+	return pendingLeaderTransfer{
 		leaderTransferC: make(chan uint64, 1),
 	}
 }
@@ -562,8 +578,8 @@ func (l *pendingLeaderTransfer) get() (uint64, bool) {
 	return 0, false
 }
 
-func newPendingSnapshot(snapshotC chan<- rsm.SSRequest) *pendingSnapshot {
-	return &pendingSnapshot{
+func newPendingSnapshot(snapshotC chan<- rsm.SSRequest) pendingSnapshot {
+	return pendingSnapshot{
 		logicalClock: newLogicalClock(),
 		snapshotC:    snapshotC,
 	}
@@ -667,8 +683,8 @@ func (p *pendingSnapshot) apply(key uint64,
 }
 
 func newPendingConfigChange(confChangeC chan<- configChangeRequest,
-	notifyCommit bool) *pendingConfigChange {
-	return &pendingConfigChange{
+	notifyCommit bool) pendingConfigChange {
+	return pendingConfigChange{
 		confChangeC:  confChangeC,
 		logicalClock: newLogicalClock(),
 		notifyCommit: notifyCommit,
@@ -701,10 +717,7 @@ func (p *pendingConfigChange) request(cc pb.ConfigChange,
 	if p.confChangeC == nil {
 		return nil, ErrClusterClosed
 	}
-	data, err := cc.Marshal()
-	if err != nil {
-		plog.Panicf("%v", err)
-	}
+	data := pb.MustMarshal(&cc)
 	ccreq := configChangeRequest{
 		key:  random.LockGuardedRand.Uint64(),
 		data: data,
@@ -785,15 +798,13 @@ func (p *pendingConfigChange) apply(key uint64, rejected bool) {
 	}
 }
 
-func newPendingReadIndex(pool *sync.Pool,
-	requests *readIndexQueue) *pendingReadIndex {
-	p := &pendingReadIndex{
+func newPendingReadIndex(pool *sync.Pool, r *readIndexQueue) pendingReadIndex {
+	return pendingReadIndex{
 		batches:      make(map[pb.SystemCtx]readBatch),
-		requests:     requests,
+		requests:     r,
 		logicalClock: newLogicalClock(),
 		pool:         pool,
 	}
-	return p
 }
 
 func (p *pendingReadIndex) close() {
@@ -966,18 +977,16 @@ func getRng(clusterID uint64, nodeID uint64, shard uint64) *keyGenerator {
 	nano := time.Now().UnixNano()
 	seedStr := fmt.Sprintf("%d-%d-%d-%d-%d", pid, nano, clusterID, nodeID, shard)
 	m := sha512.New()
-	if _, err := io.WriteString(m, seedStr); err != nil {
-		plog.Panicf("%v", err)
-	}
+	fileutil.MustWrite(m, []byte(seedStr))
 	sum := m.Sum(nil)
 	seed := binary.LittleEndian.Uint64(sum)
 	return &keyGenerator{rand: rand.New(rand.NewSource(int64(seed)))}
 }
 
 func newPendingProposal(cfg config.Config,
-	notifyCommit bool, pool *sync.Pool, proposals *entryQueue) *pendingProposal {
+	notifyCommit bool, pool *sync.Pool, proposals *entryQueue) pendingProposal {
 	ps := pendingProposalShards
-	p := &pendingProposal{
+	p := pendingProposal{
 		shards: make([]*proposalShard, ps),
 		keyg:   make([]*keyGenerator, ps),
 		ps:     ps,

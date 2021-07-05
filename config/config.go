@@ -20,18 +20,17 @@ package config
 
 import (
 	"crypto/tls"
-	"errors"
-	"io/ioutil"
 	"net"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/netutil"
 	"github.com/lni/goutils/stringutil"
 
+	"github.com/lni/dragonboat/v3/internal/fileutil"
 	"github.com/lni/dragonboat/v3/internal/id"
 	"github.com/lni/dragonboat/v3/internal/settings"
 	"github.com/lni/dragonboat/v3/internal/vfs"
@@ -72,6 +71,9 @@ type Config struct {
 	// non-leader node status and step down to become a follower node when it no
 	// longer has the quorum.
 	CheckQuorum bool
+	// Whether to use PreVote for this node. PreVote is described in the section
+	// 9.7 of the raft thesis.
+	PreVote bool
 	// ElectionRTT is the minimum number of message RTT between elections. Message
 	// RTT is defined by NodeHostConfig.RTTMillisecond. The Raft paper suggests it
 	// to be a magnitude greater than HeartbeatRTT, which is the interval between
@@ -132,6 +134,14 @@ type Config struct {
 	CompactionOverhead uint64
 	// OrderedConfigChange determines whether Raft membership change is enforced
 	// with ordered config change ID.
+	//
+	// When set to true, ConfigChangeIndex is required for membership change
+	// requests. This behaves like an optimistic write lock forcing clients to
+	// linearize membership change requests explicitly. (recommended)
+	//
+	// When set to false (default), ConfigChangeIndex is ignored for membership
+	// change requests. This may cause a client to request a membership change
+	// based on stale membership data.
 	OrderedConfigChange bool
 	// MaxInMemLogSize is the target size in bytes allowed for storing in memory
 	// Raft logs on each Raft node. In memory Raft logs are the ones that have
@@ -159,14 +169,16 @@ type Config struct {
 	// disable such auto compactions and use NodeHost.RequestCompaction to
 	// manually request such compactions when necessary.
 	DisableAutoCompactions bool
-	// IsObserver indicates whether this is an observer Raft node without voting
-	// power. Described as non-voting members in the section 4.2.1 of Diego
-	// Ongaro's thesis, observer nodes are usually used to allow a new node to
-	// join the cluster and catch up with other existing ndoes without impacting
-	// the availability. Extra observer nodes can also be introduced to serve
-	// read-only requests without affecting system write throughput.
+	// IsNonVoting indicates whether this is a non-voting Raft node. Described as
+	// non-voting members in the section 4.2.1 of Diego Ongaro's thesis, they are
+	// used to allow a new node to join the cluster and catch up with other
+	// existing ndoes without impacting the availability. Extra non-voting nodes
+	// can also be introduced to serve read-only requests.
+	IsNonVoting bool
+	// IsObserver indicates whether this is a non-voting Raft node without voting
+	// power.
 	//
-	// Observer support is currently experimental.
+	// Deprecated: use IsNonVoting instead.
 	IsObserver bool
 	// IsWitness indicates whether this is a witness Raft node without actual log
 	// replication and do not have state machine. It is mentioned in the section
@@ -215,8 +227,11 @@ func (c *Config) Validate() error {
 	if c.IsWitness && c.SnapshotEntries > 0 {
 		return errors.New("witness node can not take snapshot")
 	}
-	if c.IsWitness && c.IsObserver {
-		return errors.New("witness node can not be an observer")
+	if c.IsObserver {
+		c.IsNonVoting = true
+	}
+	if c.IsWitness && c.IsNonVoting {
+		return errors.New("witness node can not be a non-voting node")
 	}
 	return nil
 }
@@ -274,7 +289,7 @@ type NodeHostConfig struct {
 	// by their NodeHostID values. This feature is usually used when only dynamic
 	// addresses are available. When enabled, NodeHostID values should be used
 	// as the target parameter when calling NodeHost's StartCluster,
-	// RequestAddNode, RequestAddObserver and RequestAddWitness methods.
+	// RequestAddNode, RequestAddNonVoting and RequestAddWitness methods.
 	//
 	// Enabling AddressByNodeHostID also enables the internal gossip service,
 	// NodeHostConfig.Gossip must be configured to control the behaviors of the
@@ -313,13 +328,13 @@ type NodeHostConfig struct {
 	// used by NodeHost. The default zero value causes the default built-in RocksDB
 	// based Log DB implementation to be used.
 	//
-	// Depreciated: Use NodeHostConfig.Expert.LogDBFactory instead.
+	// Deprecated: Use NodeHostConfig.Expert.LogDBFactory instead.
 	LogDBFactory LogDBFactoryFunc
 	// RaftRPCFactory is the factory function used for creating the transport
 	// instance for exchanging Raft message between NodeHost instances. The default
 	// zero value causes the built-in TCP based transport to be used.
 	//
-	// Depreciated: Use NodeHostConfig.Expert.TransportFactory instead.
+	// Deprecated: Use NodeHostConfig.Expert.TransportFactory instead.
 	RaftRPCFactory RaftRPCFactoryFunc
 	// EnableMetrics determines whether health metrics in Prometheus format should
 	// be enabled.
@@ -496,14 +511,14 @@ type LogDBCallback func(LogDBInfo)
 // RaftRPCFactoryFunc is the factory function that creates the transport module
 // instance for exchanging Raft messages between NodeHosts.
 //
-// Depreciated: Use TransportFactory instead.
+// Deprecated: Use TransportFactory instead.
 type RaftRPCFactoryFunc func(NodeHostConfig,
 	raftio.MessageHandler, raftio.ChunkHandler) raftio.ITransport
 
 // LogDBFactoryFunc is the factory function that creates NodeHost's persistent
 // storage module known as Log DB.
 //
-// Depreciated: User LogDBFactory instead.
+// Deprecated: Use LogDBFactory instead.
 type LogDBFactoryFunc func(NodeHostConfig,
 	LogDBCallback, []string, []string) (raftio.ILogDB, error)
 
@@ -516,9 +531,11 @@ func (c *NodeHostConfig) Validate() error {
 	if len(c.NodeHostDir) == 0 {
 		return errors.New("NodeHostConfig.NodeHostDir is empty")
 	}
-	if !c.MutualTLS &&
-		(len(c.CAFile) > 0 || len(c.CertFile) > 0 || len(c.KeyFile) > 0) {
-		plog.Warningf("CAFile/CertFile/KeyFile specified when MutualTLS is disabled")
+	if !c.MutualTLS {
+		plog.Warningf("mutual TLS disabled, communication is insecure")
+		if len(c.CAFile) > 0 || len(c.CertFile) > 0 || len(c.KeyFile) > 0 {
+			plog.Warningf("CAFile/CertFile/KeyFile specified when MutualTLS is disabled")
+		}
 	}
 	if c.MutualTLS {
 		if len(c.CAFile) == 0 {
@@ -592,21 +609,31 @@ func (l *defaultLogDB) Create(nhConfig NodeHostConfig,
 }
 
 func (l *defaultLogDB) Name() string {
-	dir, err := ioutil.TempDir("", "logdb_check_name")
+	fs := vfs.DefaultFS
+	dir, err := fileutil.TempDir("", "dragonboat-logdb-test", fs)
 	if err != nil {
-		plog.Panicf("failed to get temp dir, %v", err)
+		panic(err)
 	}
+	defer func() {
+		if err := fs.RemoveAll(dir); err != nil {
+			panic(err)
+		}
+	}()
 	nhc := NodeHostConfig{
 		Expert: ExpertConfig{
 			LogDB: GetDefaultLogDBConfig(),
+			FS:    fs,
 		},
 	}
 	ldb, err := l.factory(nhc, nil, []string{dir}, []string{})
 	if err != nil {
 		plog.Panicf("failed to create ldb, %v", err)
 	}
-	defer os.RemoveAll(dir)
-	defer ldb.Close()
+	defer func() {
+		if err := ldb.Close(); err != nil {
+			panic(err)
+		}
+	}()
 	return ldb.Name()
 }
 

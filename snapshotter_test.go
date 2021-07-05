@@ -17,10 +17,10 @@ package dragonboat
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 	"reflect"
 	"testing"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/leaktest"
 
 	"github.com/lni/dragonboat/v3/config"
@@ -34,6 +34,7 @@ import (
 
 const (
 	tmpSnapshotDirSuffix = "generating"
+	recvTmpDirSuffix     = "receiving"
 	rdbTestDirectory     = "rdb_test_dir_safe_to_delete"
 )
 
@@ -49,7 +50,8 @@ func getNewTestDB(dir string, lldir string, fs vfs.IFS) raftio.ILogDB {
 	cfg := config.NodeHostConfig{
 		Expert: config.GetDefaultExpertConfig(),
 	}
-	db, err := logdb.NewDefaultLogDB(cfg, nil, []string{d}, []string{lld}, fs)
+	cfg.Expert.FS = fs
+	db, err := logdb.NewDefaultLogDB(cfg, nil, []string{d}, []string{lld})
 	if err != nil {
 		panic(err.Error())
 	}
@@ -70,7 +72,8 @@ func getTestSnapshotter(ldb raftio.ILogDB, fs vfs.IFS) *snapshotter {
 	f := func(cid uint64, nid uint64) string {
 		return fp
 	}
-	return newSnapshotter(1, 1, f, ldb, fs)
+	lr := logdb.NewLogReader(1, 1, ldb)
+	return newSnapshotter(1, 1, f, ldb, lr, fs)
 }
 
 func runSnapshotterTest(t *testing.T,
@@ -103,7 +106,7 @@ func TestFinalizeSnapshotReturnExpectedErrorWhenOutOfDate(t *testing.T) {
 		if err := env.CreateTempDir(); err != nil {
 			t.Errorf("create tmp snapshot dir failed %v", err)
 		}
-		if err := s.commit(ss, rsm.SSRequest{}); err != errSnapshotOutOfDate {
+		if err := s.Commit(ss, rsm.SSRequest{}); !errors.Is(err, errSnapshotOutOfDate) {
 			t.Errorf("unexpected error result %v", err)
 		}
 	}
@@ -139,26 +142,22 @@ func TestSnapshotCanBeFinalized(t *testing.T) {
 			t.Fatalf("write failed %v", err)
 		}
 		f.Close()
-		if err = s.commit(ss, rsm.SSRequest{}); err != nil {
+		if err = s.Commit(ss, rsm.SSRequest{}); err != nil {
 			t.Errorf("finalize snapshot failed %v", err)
 		}
-		snapshots, err := ldb.ListSnapshots(1, 1, math.MaxUint64)
+		snapshot, err := ldb.GetSnapshot(1, 1)
 		if err != nil {
 			t.Errorf("failed to list snapshot")
 		}
-		if len(snapshots) != 1 {
-			t.Errorf("returned %d snapshot records, want 1", len(snapshots))
+		if pb.IsEmptySnapshot(snapshot) {
+			t.Errorf("failed to get snapshot")
 		}
-		rs, err := s.GetSnapshot(100)
+		rs, err := s.GetSnapshotFromLogDB()
 		if err != nil {
 			t.Errorf("failed to get snapshot")
 		}
 		if rs.Index != 100 {
 			t.Errorf("returned an unexpected snapshot")
-		}
-		_, err = s.GetSnapshot(200)
-		if err != ErrNoSnapshot {
-			t.Errorf("unexpected err %v", err)
 		}
 		if _, err = fs.Stat(tmpDir); !vfs.IsNotExist(err) {
 			t.Errorf("tmp dir not removed, %v", err)
@@ -196,14 +195,11 @@ func TestSnapshotCanBeSavedToLogDB(t *testing.T) {
 		if err := s.saveSnapshot(s1); err != nil {
 			t.Errorf("failed to save snapshot record %v", err)
 		}
-		snapshots, err := ldb.ListSnapshots(1, 1, math.MaxUint64)
+		snapshot, err := ldb.GetSnapshot(1, 1)
 		if err != nil {
 			t.Errorf("failed to list snapshot")
 		}
-		if len(snapshots) != 1 {
-			t.Errorf("returned %d snapshot records, want 1", len(snapshots))
-		}
-		if !reflect.DeepEqual(&s1, &snapshots[0]) {
+		if !reflect.DeepEqual(s1, snapshot) {
 			t.Errorf("snapshot record changed")
 		}
 	}
@@ -218,8 +214,8 @@ func TestZombieSnapshotDirsCanBeRemoved(t *testing.T) {
 		env2 := s.getEnv(200)
 		fd1 := env1.GetFinalDir()
 		fd2 := env2.GetFinalDir()
-		fd1 = fs.PathJoin(fd1, tmpSnapshotDirSuffix)
-		fd2 = fs.PathJoin(fd2, ".receiving")
+		fd1 = fd1 + "-100." + tmpSnapshotDirSuffix
+		fd2 = fd2 + "-100." + recvTmpDirSuffix
 		if err := fs.MkdirAll(fd1, 0755); err != nil {
 			t.Errorf("failed to create dir %v", err)
 		}
@@ -229,11 +225,80 @@ func TestZombieSnapshotDirsCanBeRemoved(t *testing.T) {
 		if err := s.processOrphans(); err != nil {
 			t.Errorf("failed to process orphaned snapshtos %s", err)
 		}
-		if _, err := fs.Stat(fd1); vfs.IsNotExist(err) {
+		if _, err := fs.Stat(fd1); !vfs.IsNotExist(err) {
 			t.Errorf("fd1 not removed")
 		}
-		if _, err := fs.Stat(fd2); vfs.IsNotExist(err) {
+		if _, err := fs.Stat(fd2); !vfs.IsNotExist(err) {
 			t.Errorf("fd2 not removed")
+		}
+	}
+	runSnapshotterTest(t, fn, fs)
+}
+
+func TestSnapshotsNotInLogDBAreRemoved(t *testing.T) {
+	fs := vfs.GetTestFS()
+	fn := func(t *testing.T, ldb raftio.ILogDB, s *snapshotter) {
+		env1 := s.getEnv(100)
+		env2 := s.getEnv(200)
+		fd1 := env1.GetFinalDir()
+		fd2 := env2.GetFinalDir()
+		if err := fs.MkdirAll(fd1, 0755); err != nil {
+			t.Errorf("failed to create dir %v", err)
+		}
+		if err := fs.MkdirAll(fd2, 0755); err != nil {
+			t.Errorf("failed to create dir %v", err)
+		}
+		if err := s.processOrphans(); err != nil {
+			t.Errorf("failed to process orphaned snapshtos %s", err)
+		}
+		if _, err := fs.Stat(fd1); !vfs.IsNotExist(err) {
+			t.Errorf("fd1 %s not removed", fd1)
+		}
+		if _, err := fs.Stat(fd2); !vfs.IsNotExist(err) {
+			t.Errorf("fd2 %s not removed", fd2)
+		}
+	}
+	runSnapshotterTest(t, fn, fs)
+}
+
+func TestOnlyMostRecentSnapshotIsKept(t *testing.T) {
+	fs := vfs.GetTestFS()
+	fn := func(t *testing.T, ldb raftio.ILogDB, s *snapshotter) {
+		env1 := s.getEnv(100)
+		env2 := s.getEnv(200)
+		env3 := s.getEnv(300)
+		s1 := pb.Snapshot{
+			FileSize: 1234,
+			Filepath: "f2",
+			Index:    200,
+			Term:     200,
+		}
+		fd1 := env1.GetFinalDir()
+		fd2 := env2.GetFinalDir()
+		fd3 := env3.GetFinalDir()
+		if err := s.saveSnapshot(s1); err != nil {
+			t.Errorf("failed to save snapshot to logdb")
+		}
+		if err := fs.MkdirAll(fd1, 0755); err != nil {
+			t.Errorf("failed to create dir %v", err)
+		}
+		if err := fs.MkdirAll(fd2, 0755); err != nil {
+			t.Errorf("failed to create dir %v", err)
+		}
+		if err := fs.MkdirAll(fd3, 0755); err != nil {
+			t.Errorf("failed to create dir %v", err)
+		}
+		if err := s.processOrphans(); err != nil {
+			t.Errorf("failed to process orphaned snapshtos %s", err)
+		}
+		if _, err := fs.Stat(fd1); !vfs.IsNotExist(err) {
+			t.Errorf("fd1 %s not removed", fd1)
+		}
+		if _, err := fs.Stat(fd2); vfs.IsNotExist(err) {
+			t.Errorf("fd2 %s removed by mistake", fd2)
+		}
+		if _, err := fs.Stat(fd3); !vfs.IsNotExist(err) {
+			t.Errorf("fd3 %s not removed", fd3)
 		}
 	}
 	runSnapshotterTest(t, fn, fs)
@@ -317,15 +382,12 @@ func TestOrphanedSnapshotRecordIsRemoved(t *testing.T) {
 		if fileutil.HasFlagFile(fd2, fileutil.SnapshotFlagFilename, fs) {
 			t.Errorf("flag for fd2 not removed")
 		}
-		snapshots, err := s.logdb.ListSnapshots(1, 1, 200)
+		snapshot, err := s.logdb.GetSnapshot(1, 1)
 		if err != nil {
 			t.Fatalf("failed to list snapshot %v", err)
 		}
-		if len(snapshots) != 1 {
-			t.Fatalf("unexpected number of records %d", len(snapshots))
-		}
-		if snapshots[0].Index != 200 {
-			t.Fatalf("unexpected record %v", snapshots[0])
+		if snapshot.Index != 200 {
+			t.Fatalf("unexpected record %v", snapshot)
 		}
 	}
 	runSnapshotterTest(t, fn, fs)
@@ -406,21 +468,10 @@ func TestOrphanedSnapshotsCanBeProcessed(t *testing.T) {
 	runSnapshotterTest(t, fn, fs)
 }
 
-func TestRemoveUnusedSnapshotRemoveSnapshots(t *testing.T) {
+func TestSnapshotterCompact(t *testing.T) {
 	fs := vfs.GetTestFS()
-	defer leaktest.AfterTest(t)()
-	// normal case
-	testRemoveUnusedSnapshotRemoveSnapshots(t, 32, 7, 5, fs)
-	// snapshotsToKeep snapshots will be kept
-	testRemoveUnusedSnapshotRemoveSnapshots(t, 4, 5, 2, fs)
-	// snapshotsToKeep snapshots will be kept
-	testRemoveUnusedSnapshotRemoveSnapshots(t, 3, 3, 1, fs)
-}
-
-func testRemoveUnusedSnapshotRemoveSnapshots(t *testing.T,
-	total uint64, upTo uint64, removed uint64, fs vfs.IFS) {
 	fn := func(t *testing.T, ldb raftio.ILogDB, snapshotter *snapshotter) {
-		for i := uint64(1); i <= total; i++ {
+		for i := uint64(1); i <= uint64(3); i++ {
 			fn := fmt.Sprintf("f%d.data", i)
 			s := pb.Snapshot{
 				FileSize: 1234,
@@ -432,7 +483,7 @@ func testRemoveUnusedSnapshotRemoveSnapshots(t *testing.T,
 			if err := env.CreateTempDir(); err != nil {
 				t.Errorf("failed to create snapshot dir")
 			}
-			if err := snapshotter.commit(s, rsm.SSRequest{}); err != nil {
+			if err := snapshotter.Commit(s, rsm.SSRequest{}); err != nil {
 				t.Errorf("failed to save snapshot record")
 			}
 			fp := snapshotter.getFilePath(s.Index)
@@ -442,47 +493,23 @@ func testRemoveUnusedSnapshotRemoveSnapshots(t *testing.T,
 			}
 			f.Close()
 		}
-		snapshots, err := ldb.ListSnapshots(1, 1, math.MaxUint64)
-		if err != nil {
-			t.Errorf("failed to list snapshot")
-		}
-		if uint64(len(snapshots)) != total {
-			t.Errorf("didn't return %d snapshot records", total)
-		}
-		for i := uint64(1); i < removed; i++ {
-			env := snapshotter.getEnv(i)
-			snapDir := env.GetFinalDir()
-			if _, err = fs.Stat(snapDir); vfs.IsNotExist(err) {
-				t.Errorf("snapshot dir didn't get created, %s", snapDir)
-			}
-		}
-		if err = snapshotter.compact(upTo); err != nil {
+		if err := snapshotter.Compact(2); err != nil {
 			t.Errorf("failed to remove unused snapshots, %v", err)
 		}
-		snapshots, err = ldb.ListSnapshots(1, 1, math.MaxUint64)
-		if err != nil {
-			t.Errorf("failed to list snapshot")
-		}
-		if uint64(len(snapshots)) != total-removed+1 {
-			t.Errorf("got %d, want %d, first index %d",
-				len(snapshots), total-removed+1, snapshots[0].Index)
-		}
-		for _, s := range snapshots {
-			if s.Index < removed {
-				t.Errorf("didn't remove snapshot %d", s.Index)
-			}
-		}
-		for i := uint64(0); i < removed; i++ {
-			fp := snapshotter.getFilePath(i)
-			if _, err := fs.Stat(fp); !vfs.IsNotExist(err) {
-				t.Errorf("snapshot file didn't get deleted")
-			}
-			env := snapshotter.getEnv(i)
+		check := func(index uint64, exist bool) {
+			env := snapshotter.getEnv(index)
 			snapDir := env.GetFinalDir()
-			if _, err := fs.Stat(snapDir); !vfs.IsNotExist(err) {
+			_, err := fs.Stat(snapDir)
+			if exist && vfs.IsNotExist(err) {
 				t.Errorf("snapshot dir didn't get removed")
 			}
+			if !exist && !vfs.IsNotExist(err) {
+				t.Errorf("failed to be removed")
+			}
 		}
+		check(1, true)
+		check(2, false)
+		check(3, true)
 	}
 	runSnapshotterTest(t, fn, fs)
 }
@@ -503,7 +530,7 @@ func TestShrinkSnapshots(t *testing.T) {
 			if err := env.CreateTempDir(); err != nil {
 				t.Errorf("failed to create snapshot dir")
 			}
-			if err := snapshotter.commit(s, rsm.SSRequest{}); err != nil {
+			if err := snapshotter.Commit(s, rsm.SSRequest{}); err != nil {
 				t.Errorf("failed to save snapshot record")
 			}
 			fp = snapshotter.getFilePath(s.Index)
@@ -526,7 +553,7 @@ func TestShrinkSnapshots(t *testing.T) {
 				t.Fatalf("close failed %v", err)
 			}
 		}
-		if err := snapshotter.shrink(20); err != nil {
+		if err := snapshotter.Shrink(20); err != nil {
 			t.Fatalf("shrink snapshots failed %v", err)
 		}
 		env1 := snapshotter.getEnv(10)
@@ -543,16 +570,9 @@ func TestShrinkSnapshots(t *testing.T) {
 				t.Fatalf("unexpected size %d, want %d", fi.Size(), esz)
 			}
 		}
-		cf(env1.GetFilepath(), 1060)
+		cf(env1.GetFilepath(), 10486832)
 		cf(env2.GetFilepath(), 1060)
 		cf(env3.GetFilepath(), 10486832)
-		snapshots, err := ldb.ListSnapshots(1, 1, math.MaxUint64)
-		if err != nil {
-			t.Errorf("failed to list snapshot")
-		}
-		if len(snapshots) != 3 {
-			t.Errorf("snapshot rec missing")
-		}
 	}
 	runSnapshotterTest(t, fn, fs)
 }

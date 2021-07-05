@@ -15,7 +15,7 @@
 package raftio
 
 import (
-	"errors"
+	"github.com/cockroachdb/errors"
 
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
@@ -62,7 +62,7 @@ type ILogDB interface {
 	// Name returns the type name of the ILogDB instance.
 	Name() string
 	// Close closes the ILogDB instance.
-	Close()
+	Close() error
 	// BinaryFormat returns an constant uint32 value representing the binary
 	// format version compatible with the ILogDB instance.
 	BinaryFormat() uint32
@@ -76,7 +76,10 @@ type ILogDB interface {
 	// the specified node.
 	GetBootstrapInfo(clusterID uint64, nodeID uint64) (pb.Bootstrap, error)
 	// SaveRaftState atomically saves the Raft states, log entries and snapshots
-	// metadata found in the pb.Update list to the log DB.
+	// metadata found in the pb.Update list to the log DB. shardID is a 1-based
+	// ID of the worker invoking the SaveRaftState method, as each worker
+	// accesses the log DB from its own thread, SaveRaftState will never be
+	// concurrently called with the same shardID.
 	SaveRaftState(updates []pb.Update, shardID uint64) error
 	// IterateEntries returns the continuous Raft log entries of the specified
 	// Raft node between the index value range of [low, high) up to a max size
@@ -88,8 +91,7 @@ type ILogDB interface {
 	// ReadRaftState returns the persistented raft state found in Log DB.
 	ReadRaftState(clusterID uint64,
 		nodeID uint64, lastIndex uint64) (RaftState, error)
-	// RemoveEntriesTo removes entries associated with the specified Raft node up
-	// to the specified index.
+	// RemoveEntriesTo removes entries with indexes between (0, index].
 	RemoveEntriesTo(clusterID uint64, nodeID uint64, index uint64) error
 	// CompactEntriesTo reclaims underlying storage space used for storing
 	// entries up to the specified index.
@@ -97,12 +99,9 @@ type ILogDB interface {
 		nodeID uint64, index uint64) (<-chan struct{}, error)
 	// SaveSnapshots saves all snapshot metadata found in the pb.Update list.
 	SaveSnapshots([]pb.Update) error
-	// DeleteSnapshot removes the specified snapshot metadata from the log DB.
-	DeleteSnapshot(clusterID uint64, nodeID uint64, index uint64) error
-	// ListSnapshots lists available snapshots associated with the specified
-	// Raft node for index range (0, index].
-	ListSnapshots(clusterID uint64,
-		nodeID uint64, index uint64) ([]pb.Snapshot, error)
+	// GetSnapshot returns the most recent snapshot associated with the specified
+	// cluster.
+	GetSnapshot(clusterID uint64, nodeID uint64) (pb.Snapshot, error)
 	// RemoveNodeData removes all data associated with the specified node.
 	RemoveNodeData(clusterID uint64, nodeID uint64) error
 	// ImportSnapshot imports the specified snapshot by creating all required

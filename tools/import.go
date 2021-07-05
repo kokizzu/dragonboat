@@ -21,11 +21,12 @@ tools for managing Dragonboat based applications.
 
 import (
 	"bytes"
-	"errors"
 	"io"
 	"os"
 	"runtime"
 	"strings"
+
+	"github.com/cockroachdb/errors"
 
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/fileutil"
@@ -33,6 +34,7 @@ import (
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/utils"
 	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/logger"
 	"github.com/lni/dragonboat/v3/raftio"
@@ -54,6 +56,8 @@ var (
 	// directory does not contain a complete snapshot.
 	ErrIncompleteSnapshot = errors.New("snapshot is incomplete")
 )
+
+var firstError = utils.FirstError
 
 // ImportSnapshot is used to repair the Raft cluster already has its quorum
 // nodes permanently lost or damaged. Such repair is only required when the
@@ -128,7 +132,7 @@ var (
 // It is your applications's responsibility to let m4 and m5 to be aware that
 // node 4 and 5 are now running there.
 func ImportSnapshot(nhConfig config.NodeHostConfig,
-	srcDir string, memberNodes map[uint64]string, nodeID uint64) error {
+	srcDir string, memberNodes map[uint64]string, nodeID uint64) (err error) {
 	if nhConfig.DeploymentID == 0 {
 		plog.Infof("NodeHostConfig.DeploymentID not set, default to %d",
 			unmanagedDeploymentID)
@@ -166,16 +170,19 @@ func ImportSnapshot(nhConfig config.NodeHostConfig,
 	if err != nil {
 		return err
 	}
-	defer env.Stop()
+	defer func() {
+		err = firstError(err, env.Close())
+	}()
 	if _, _, err := env.CreateNodeHostDir(nhConfig.DeploymentID); err != nil {
 		return err
 	}
-	logdb, err := getLogDB(*env, nhConfig, fs)
+	logdb, err := getLogDB(*env, nhConfig)
 	if err != nil {
 		return err
 	}
-	defer logdb.Close()
-
+	defer func() {
+		err = firstError(err, logdb.Close())
+	}()
 	if err := env.CheckNodeHostDir(nhConfig,
 		logdb.BinaryFormat(), logdb.Name()); err != nil {
 		return err
@@ -332,12 +339,12 @@ func checkMembers(old pb.Membership, members map[uint64]string) error {
 		if ok && v != addr {
 			return errors.New("node address changed")
 		}
-		v, ok = old.Observers[nodeID]
+		v, ok = old.NonVotings[nodeID]
 		if ok && v != addr {
 			return errors.New("node address changed")
 		}
 		if ok {
-			return errors.New("adding an observer as regular node")
+			return errors.New("adding an nonVoting as regular node")
 		}
 		v, ok = old.Witnesses[nodeID]
 		if ok && v != addr {
@@ -369,7 +376,7 @@ func getProcessedSnapshotRecord(dstDir string,
 		Membership: pb.Membership{
 			ConfigChangeId: old.Index,
 			Removed:        make(map[uint64]bool),
-			Observers:      make(map[uint64]string),
+			NonVotings:     make(map[uint64]string),
 			Addresses:      make(map[uint64]string),
 			Witnesses:      make(map[uint64]string),
 		},
@@ -384,7 +391,7 @@ func getProcessedSnapshotRecord(dstDir string,
 			ss.Membership.Removed[nid] = true
 		}
 	}
-	for nid := range old.Membership.Observers {
+	for nid := range old.Membership.NonVotings {
 		_, ok := members[nid]
 		if !ok {
 			ss.Membership.Removed[nid] = true
@@ -431,9 +438,7 @@ func copyFile(src string, dst string, fs vfs.IFS) (err error) {
 		return err
 	}
 	defer func() {
-		if cerr := in.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, in.Close())
 	}()
 	fi, err := in.Stat()
 	if err != nil {
@@ -444,9 +449,7 @@ func copyFile(src string, dst string, fs vfs.IFS) (err error) {
 		return err
 	}
 	defer func() {
-		if cerr := out.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, out.Close())
 	}()
 	if runtime.GOOS != "windows" {
 		of, ok := out.(*os.File)
@@ -466,12 +469,11 @@ func copyFile(src string, dst string, fs vfs.IFS) (err error) {
 }
 
 func getLogDB(env server.Env,
-	nhConfig config.NodeHostConfig, fs vfs.IFS) (raftio.ILogDB, error) {
+	nhConfig config.NodeHostConfig) (raftio.ILogDB, error) {
 	nhDir, walDir := env.GetLogDBDirs(nhConfig.DeploymentID)
 	if nhConfig.Expert.LogDBFactory != nil {
 		return nhConfig.Expert.LogDBFactory.Create(nhConfig,
 			nil, []string{nhDir}, []string{walDir})
 	}
-	return logdb.NewDefaultLogDB(nhConfig,
-		nil, []string{nhDir}, []string{walDir}, fs)
+	return logdb.NewDefaultLogDB(nhConfig, nil, []string{nhDir}, []string{walDir})
 }

@@ -57,7 +57,6 @@ func overwriteSettings(cfg map[string]interface{}, rd reflect.Value) {
 			case "uint64":
 				nv := uint64(val.(float64))
 				plog.Infof("Setting %s to uint64 value %d", key, nv)
-				logHardChange(key, nv)
 				field.SetUint(nv)
 			case "bool":
 				plog.Infof("Setting %s to bool value %t", key, val.(bool))
@@ -70,5 +69,3 @@ func overwriteSettings(cfg map[string]interface{}, rd reflect.Value) {
 		}
 	}
 }
-
-func logHardChange(key string, newVal uint64) {}

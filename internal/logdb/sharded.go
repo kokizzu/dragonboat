@@ -19,11 +19,13 @@ import (
 	"math"
 	"sync/atomic"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/syncutil"
 
 	"github.com/lni/dragonboat/v3/config"
+	"github.com/lni/dragonboat/v3/internal/logdb/kv"
 	"github.com/lni/dragonboat/v3/internal/server"
-	"github.com/lni/dragonboat/v3/internal/vfs"
+	"github.com/lni/dragonboat/v3/internal/utils"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
@@ -42,6 +44,8 @@ type ShardedDB struct {
 
 var _ raftio.ILogDB = (*ShardedDB)(nil)
 
+var firstError = utils.FirstError
+
 type shardCallback struct {
 	f     config.LogDBCallback
 	shard uint64
@@ -56,7 +60,8 @@ func (sc *shardCallback) callback(busy bool) {
 // OpenShardedDB creates a ShardedDB instance.
 func OpenShardedDB(config config.NodeHostConfig, cb config.LogDBCallback,
 	dirs []string, lldirs []string, batched bool, check bool,
-	fs vfs.IFS, kvf kvFactory) (*ShardedDB, error) {
+	kvf kv.Factory) (*ShardedDB, error) {
+	fs := config.Expert.FS
 	if config.Expert.LogDB.IsEmpty() {
 		panic("config.Expert.LogDB.IsEmpty()")
 	}
@@ -65,8 +70,13 @@ func OpenShardedDB(config config.NodeHostConfig, cb config.LogDBCallback,
 	}
 	shards := make([]*db, 0)
 	closeAll := func(all []*db) {
+		var err error
 		for _, s := range all {
-			s.close()
+			err = firstError(err, s.close())
+		}
+		if err != nil {
+			plog.Panicf("%+v", err)
+			panic("not suppose to reach here")
 		}
 	}
 	for i := uint64(0); i < config.Expert.LogDB.Shards; i++ {
@@ -80,7 +90,7 @@ func OpenShardedDB(config config.NodeHostConfig, cb config.LogDBCallback,
 			sc.callback, dir, lldir, batched, fs, kvf)
 		if err != nil {
 			closeAll(shards)
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		shards = append(shards, db)
 	}
@@ -89,11 +99,11 @@ func OpenShardedDB(config config.NodeHostConfig, cb config.LogDBCallback,
 			located, err := hasEntryRecord(s.kvs, true)
 			if err != nil {
 				closeAll(shards)
-				return nil, err
+				return nil, errors.WithStack(err)
 			}
 			if located {
 				closeAll(shards)
-				return OpenShardedDB(config, cb, dirs, lldirs, true, false, fs, kvf)
+				return OpenShardedDB(config, cb, dirs, lldirs, true, false, kvf)
 			}
 		}
 	}
@@ -138,7 +148,7 @@ func (s *ShardedDB) SelfCheckFailed() (bool, error) {
 	for _, shard := range s.shards {
 		failed, err := shard.selfCheckFailed()
 		if err != nil {
-			return false, err
+			return false, errors.WithStack(err)
 		}
 		if failed {
 			return true, nil
@@ -155,7 +165,7 @@ func (s *ShardedDB) SaveRaftState(updates []pb.Update, shardID uint64) error {
 	}
 	ctx := s.ctxs[shardID-1]
 	ctx.Reset()
-	return s.SaveRaftStateCtx(updates, ctx)
+	return errors.WithStack(s.SaveRaftStateCtx(updates, ctx))
 }
 
 // GetLogDBThreadContext return an IContext instance. This method is expected
@@ -170,15 +180,16 @@ func (s *ShardedDB) SaveRaftStateCtx(updates []pb.Update, ctx IContext) error {
 	if len(updates) == 0 {
 		return nil
 	}
-	pid := s.getParititionID(updates)
-	return s.shards[pid].saveRaftState(updates, ctx)
+	p := s.getParititionID(updates)
+	return errors.WithStack(s.shards[p].saveRaftState(updates, ctx))
 }
 
 // ReadRaftState returns the persistent state of the specified raft node.
 func (s *ShardedDB) ReadRaftState(clusterID uint64,
 	nodeID uint64, lastIndex uint64) (raftio.RaftState, error) {
-	idx := s.partitioner.GetPartitionID(clusterID)
-	return s.shards[idx].readRaftState(clusterID, nodeID, lastIndex)
+	p := s.partitioner.GetPartitionID(clusterID)
+	rs, err := s.shards[p].readRaftState(clusterID, nodeID, lastIndex)
+	return rs, errors.WithStack(err)
 }
 
 // ListNodeInfo lists all available NodeInfo found in the log db.
@@ -187,7 +198,7 @@ func (s *ShardedDB) ListNodeInfo() ([]raftio.NodeInfo, error) {
 	for _, v := range s.shards {
 		n, err := v.listNodeInfo()
 		if err != nil {
-			return nil, err
+			return nil, errors.WithStack(err)
 		}
 		r = append(r, n...)
 	}
@@ -199,37 +210,33 @@ func (s *ShardedDB) SaveSnapshots(updates []pb.Update) error {
 	if len(updates) == 0 {
 		return nil
 	}
-	pid := s.getParititionID(updates)
-	return s.shards[pid].saveSnapshots(updates)
+	p := s.getParititionID(updates)
+	return errors.WithStack(s.shards[p].saveSnapshots(updates))
 }
 
-// DeleteSnapshot removes the specified snapshot metadata from the log db.
-func (s *ShardedDB) DeleteSnapshot(clusterID uint64,
-	nodeID uint64, snapshotIndex uint64) error {
-	idx := s.partitioner.GetPartitionID(clusterID)
-	return s.shards[idx].deleteSnapshot(clusterID, nodeID, snapshotIndex)
-}
-
-// ListSnapshots lists all available snapshots associated with the specified
-// raft node.
-func (s *ShardedDB) ListSnapshots(clusterID uint64,
-	nodeID uint64, index uint64) ([]pb.Snapshot, error) {
-	idx := s.partitioner.GetPartitionID(clusterID)
-	return s.shards[idx].listSnapshots(clusterID, nodeID, index)
+// GetSnapshot returns the most recent snapshot associated with the specified
+// cluster.
+func (s *ShardedDB) GetSnapshot(clusterID uint64,
+	nodeID uint64) (pb.Snapshot, error) {
+	p := s.partitioner.GetPartitionID(clusterID)
+	ss, err := s.shards[p].getSnapshot(clusterID, nodeID)
+	return ss, errors.WithStack(err)
 }
 
 // SaveBootstrapInfo saves the specified bootstrap info for the given node.
 func (s *ShardedDB) SaveBootstrapInfo(clusterID uint64,
 	nodeID uint64, bootstrap pb.Bootstrap) error {
-	idx := s.partitioner.GetPartitionID(clusterID)
-	return s.shards[idx].saveBootstrapInfo(clusterID, nodeID, bootstrap)
+	p := s.partitioner.GetPartitionID(clusterID)
+	err := s.shards[p].saveBootstrapInfo(clusterID, nodeID, bootstrap)
+	return errors.WithStack(err)
 }
 
 // GetBootstrapInfo returns the saved bootstrap info for the given node.
 func (s *ShardedDB) GetBootstrapInfo(clusterID uint64,
 	nodeID uint64) (pb.Bootstrap, error) {
-	idx := s.partitioner.GetPartitionID(clusterID)
-	return s.shards[idx].getBootstrapInfo(clusterID, nodeID)
+	p := s.partitioner.GetPartitionID(clusterID)
+	bs, err := s.shards[p].getBootstrapInfo(clusterID, nodeID)
+	return bs, errors.WithStack(err)
 }
 
 // IterateEntries returns a list of saved entries starting with index low up to
@@ -237,19 +244,19 @@ func (s *ShardedDB) GetBootstrapInfo(clusterID uint64,
 func (s *ShardedDB) IterateEntries(ents []pb.Entry,
 	size uint64, clusterID uint64, nodeID uint64, low uint64, high uint64,
 	maxSize uint64) ([]pb.Entry, uint64, error) {
-	idx := s.partitioner.GetPartitionID(clusterID)
-	return s.shards[idx].iterateEntries(ents,
+	p := s.partitioner.GetPartitionID(clusterID)
+	entries, sz, err := s.shards[p].iterateEntries(ents,
 		size, clusterID, nodeID, low, high, maxSize)
+	return entries, sz, errors.WithStack(err)
 }
 
 // RemoveEntriesTo removes entries associated with the specified raft node up
 // to the specified index.
 func (s *ShardedDB) RemoveEntriesTo(clusterID uint64,
 	nodeID uint64, index uint64) error {
-	idx := s.partitioner.GetPartitionID(clusterID)
-	if err := s.shards[idx].removeEntriesTo(clusterID,
-		nodeID, index); err != nil {
-		return err
+	p := s.partitioner.GetPartitionID(clusterID)
+	if err := s.shards[p].removeEntriesTo(clusterID, nodeID, index); err != nil {
+		return errors.WithStack(err)
 	}
 	return nil
 }
@@ -264,26 +271,27 @@ func (s *ShardedDB) CompactEntriesTo(clusterID uint64,
 
 // RemoveNodeData deletes all node data that belongs to the specified node.
 func (s *ShardedDB) RemoveNodeData(clusterID uint64, nodeID uint64) error {
-	idx := s.partitioner.GetPartitionID(clusterID)
-	return s.shards[idx].removeNodeData(clusterID, nodeID)
+	p := s.partitioner.GetPartitionID(clusterID)
+	return errors.WithStack(s.shards[p].removeNodeData(clusterID, nodeID))
 }
 
 // ImportSnapshot imports the snapshot record and other metadata records to the
 // system.
 func (s *ShardedDB) ImportSnapshot(ss pb.Snapshot, nodeID uint64) error {
-	idx := s.partitioner.GetPartitionID(ss.ClusterId)
-	return s.shards[idx].importSnapshot(ss, nodeID)
+	p := s.partitioner.GetPartitionID(ss.ClusterId)
+	return errors.WithStack(s.shards[p].importSnapshot(ss, nodeID))
 }
 
 // Close closes the ShardedDB instance.
-func (s *ShardedDB) Close() {
+func (s *ShardedDB) Close() (err error) {
 	s.stopper.Stop()
 	for _, v := range s.shards {
-		v.close()
+		err = firstError(err, v.close())
 	}
 	for _, v := range s.ctxs {
 		v.Destroy()
 	}
+	return err
 }
 
 func (s *ShardedDB) getParititionID(updates []pb.Update) uint64 {
@@ -308,7 +316,9 @@ func (s *ShardedDB) compactionWorkerMain() {
 		case <-s.stopper.ShouldStop():
 			return
 		case <-s.compactionCh:
-			s.compact()
+			if err := s.compact(); err != nil {
+				panicNow(err)
+			}
 		}
 		select {
 		case <-s.stopper.ShouldStop():
@@ -333,13 +343,13 @@ func (s *ShardedDB) addCompaction(clusterID uint64,
 	return done
 }
 
-func (s *ShardedDB) compact() {
+func (s *ShardedDB) compact() error {
 	for {
 		if t, hasTask := s.compactions.getTask(); hasTask {
 			idx := s.partitioner.GetPartitionID(t.clusterID)
 			shard := s.shards[idx]
 			if err := shard.compact(t.clusterID, t.nodeID, t.index); err != nil {
-				panic(err)
+				return err
 			}
 			atomic.AddUint64(&s.completedCompactions, 1)
 			close(t.done)
@@ -347,11 +357,16 @@ func (s *ShardedDB) compact() {
 				dn(t.clusterID, t.nodeID), t.index)
 			select {
 			case <-s.stopper.ShouldStop():
-				return
+				return nil
 			default:
 			}
 		} else {
-			return
+			return nil
 		}
 	}
+}
+
+func panicNow(err error) {
+	plog.Panicf("%+v", err)
+	panic(err)
 }

@@ -204,10 +204,11 @@ func doGetTestRaftNodes(startID uint64, count int, ordered bool,
 			Expert: config.GetDefaultExpertConfig(),
 		}
 		cfg.Expert.LogDB.Shards = 2
+		cfg.Expert.FS = fs
 		ldb, err = logdb.NewDefaultLogDB(cfg,
-			nil, []string{nodeLogDir}, []string{nodeLowLatencyLogDir}, fs)
+			nil, []string{nodeLogDir}, []string{nodeLowLatencyLogDir})
 		if err != nil {
-			plog.Panicf("failed to open logdb, %v", err)
+			plog.Panicf("failed to open logdb, %+v", err)
 		}
 	}
 	// message router
@@ -222,7 +223,9 @@ func doGetTestRaftNodes(startID uint64, count int, ordered bool,
 		rootDirFunc := func(cid uint64, nid uint64) string {
 			return snapdir
 		}
-		snapshotter := newSnapshotter(testClusterID, i, rootDirFunc, ldb, fs)
+		lr := logdb.NewLogReader(testClusterID, i, ldb)
+		snapshotter := newSnapshotter(testClusterID, i, rootDirFunc, ldb, lr, fs)
+		lr.SetCompactor(snapshotter)
 		// create the sm
 		noopSM := &tests.NoOP{}
 		cfg := config.Config{
@@ -249,6 +252,7 @@ func doGetTestRaftNodes(startID uint64, count int, ordered bool,
 			nhConfig,
 			create,
 			snapshotter,
+			lr,
 			&dummyEngine{},
 			nil,
 			nil,
@@ -277,13 +281,19 @@ func step(nodes []*node) bool {
 	for _, node := range nodes {
 		if !node.initialized() {
 			commit := rsm.Task{Initial: true}
-			index, _ := node.sm.Recover(commit)
-			node.setInitialStatus(index)
+			ss, _ := node.sm.Recover(commit)
+			node.setInitialStatus(ss.Index)
 		}
 		if node.initialized() {
-			if node.handleEvents() {
-				hasEvent = true
-				ud, ok := node.getUpdate()
+			hasEvent, err := node.handleEvents()
+			if err != nil {
+				panic(err)
+			}
+			if hasEvent {
+				ud, ok, err := node.getUpdate()
+				if err != nil {
+					panic(err)
+				}
 				if ok {
 					nodeUpdates = append(nodeUpdates, ud)
 					activeNodes = append(activeNodes, node)
@@ -398,7 +408,7 @@ func isStableGroup(nodes []*node) bool {
 			hasLeader = true
 			continue
 		}
-		if node.p == nil || !node.isFollower() {
+		if !node.isFollower() {
 			inElection = true
 		}
 	}
@@ -542,10 +552,17 @@ func TestLastAppliedValueCanBeReturned(t *testing.T) {
 		sm := smList[0]
 		for i := uint64(5); i <= 100; i++ {
 			sm.SetLastApplied(i)
-			if !n.handleEvents() {
+			hasEvent, err := n.handleEvents()
+			if err != nil {
+				t.Fatalf("unexpected error %v", err)
+			}
+			if !hasEvent {
 				t.Errorf("handle events reported no event")
 			}
-			ud, ok := n.getUpdate()
+			ud, ok, err := n.getUpdate()
+			if err != nil {
+				t.Fatalf("unexpected error %v", err)
+			}
 			if !ok {
 				t.Errorf("no update")
 			} else {
@@ -557,10 +574,18 @@ func TestLastAppliedValueCanBeReturned(t *testing.T) {
 			ud.UpdateCommit.LastApplied = 0
 			n.p.Commit(ud)
 		}
-		if n.handleEvents() {
+		hasEvents, err := n.handleEvents()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if hasEvents {
 			t.Errorf("unexpected event")
 		}
-		if ud, ok := n.getUpdate(); ok {
+		ud, ok, err := n.getUpdate()
+		if err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if ok {
 			t.Errorf("unexpected update, %+v", ud)
 		}
 	}
@@ -579,8 +604,12 @@ func TestLastAppliedValueIsAlwaysOneWayIncreasing(t *testing.T) {
 		n := nodes[0]
 		sm := smList[0]
 		sm.SetLastApplied(1)
-		n.handleEvents()
-		n.getUpdate()
+		if _, err := n.handleEvents(); err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
+		if _, _, err := n.getUpdate(); err != nil {
+			t.Fatalf("unexpected error %v", err)
+		}
 	}
 	runRaftNodeTest(t, false, false, tf, fs)
 }
@@ -1376,8 +1405,8 @@ func TestSnapshotCanBeMade(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to get snapshot count")
 			}
-			if count < 3 {
-				t.Errorf("%s has less than 3 snapshot images", dir)
+			if count == 0 {
+				t.Errorf("no snapshot image")
 			}
 		}
 	}
@@ -1554,7 +1583,7 @@ func (d *dummyPipeline) setSaveReady(clusterID uint64)    {}
 func (d *dummyPipeline) setRecoverReady(clusterID uint64) {}
 
 func TestProcessUninitilizedNode(t *testing.T) {
-	n := &node{ss: &snapshotState{}, pipeline: &dummyPipeline{}}
+	n := &node{ss: snapshotState{}, pipeline: &dummyPipeline{}}
 	if !n.processUninitializedNodeStatus() {
 		t.Errorf("failed to returned the recover request")
 	}
@@ -1568,7 +1597,7 @@ func TestProcessUninitilizedNode(t *testing.T) {
 	if !req.Initial || !req.Recover {
 		t.Errorf("unexpected req")
 	}
-	n2 := &node{ss: &snapshotState{}, initializedC: make(chan struct{})}
+	n2 := &node{ss: snapshotState{}, initializedC: make(chan struct{})}
 	n2.setInitialized()
 	if n2.processUninitializedNodeStatus() {
 		t.Errorf("unexpected recover from snapshot request")
@@ -1576,14 +1605,14 @@ func TestProcessUninitilizedNode(t *testing.T) {
 }
 
 func TestProcessRecoveringNodeCanBeSkipped(t *testing.T) {
-	n := &node{ss: &snapshotState{}}
+	n := &node{ss: snapshotState{}}
 	if n.processRecoverStatus() {
 		t.Errorf("processRecoveringNode not skipped")
 	}
 }
 
 func TestProcessTakingSnapshotNodeCanBeSkipped(t *testing.T) {
-	n := &node{ss: &snapshotState{}}
+	n := &node{ss: snapshotState{}}
 	if n.processSaveStatus() {
 		t.Errorf("processTakingSnapshotNode not skipped")
 	}
@@ -1591,7 +1620,7 @@ func TestProcessTakingSnapshotNodeCanBeSkipped(t *testing.T) {
 
 func TestRecoveringFromSnapshotNodeCanComplete(t *testing.T) {
 	n := &node{
-		ss:           &snapshotState{},
+		ss:           snapshotState{},
 		sysEvents:    newSysEventListener(nil, nil),
 		initializedC: make(chan struct{}),
 	}
@@ -1612,7 +1641,7 @@ func TestRecoveringFromSnapshotNodeCanComplete(t *testing.T) {
 }
 
 func TestNotReadyRecoveringFromSnapshotNode(t *testing.T) {
-	n := &node{ss: &snapshotState{}, sysEvents: newSysEventListener(nil, nil)}
+	n := &node{ss: snapshotState{}, sysEvents: newSysEventListener(nil, nil)}
 	n.ss.setRecovering()
 	if !n.processRecoverStatus() {
 		t.Errorf("not skipped")
@@ -1620,7 +1649,7 @@ func TestNotReadyRecoveringFromSnapshotNode(t *testing.T) {
 }
 
 func TestTakingSnapshotNodeCanComplete(t *testing.T) {
-	n := &node{ss: &snapshotState{}, initializedC: make(chan struct{})}
+	n := &node{ss: snapshotState{}, initializedC: make(chan struct{})}
 	n.ss.setSaving()
 	n.ss.notifySnapshotStatus(true, false, false, false, 0)
 	n.setInitialized()
@@ -1638,7 +1667,7 @@ func TestTakingSnapshotOnUninitializedNodeWillPanic(t *testing.T) {
 			t.Fatalf("panic not triggered")
 		}
 	}()
-	n := &node{ss: &snapshotState{}}
+	n := &node{ss: snapshotState{}}
 	n.ss.setSaving()
 	n.ss.notifySnapshotStatus(true, false, false, false, 0)
 	n.processSaveStatus()
@@ -1667,17 +1696,17 @@ func TestGetCompactionOverhead(t *testing.T) {
 
 type testDummyNodeProxy struct{}
 
-func (np *testDummyNodeProxy) StepReady()                                        {}
-func (np *testDummyNodeProxy) RestoreRemotes(pb.Snapshot)                        {}
-func (np *testDummyNodeProxy) ApplyUpdate(pb.Entry, sm.Result, bool, bool, bool) {}
-func (np *testDummyNodeProxy) ApplyConfigChange(pb.ConfigChange, uint64, bool)   {}
-func (np *testDummyNodeProxy) NodeID() uint64                                    { return 1 }
-func (np *testDummyNodeProxy) ClusterID() uint64                                 { return 1 }
-func (np *testDummyNodeProxy) ShouldStop() <-chan struct{}                       { return nil }
+func (np *testDummyNodeProxy) StepReady()                                            {}
+func (np *testDummyNodeProxy) RestoreRemotes(pb.Snapshot) error                      { return nil }
+func (np *testDummyNodeProxy) ApplyUpdate(pb.Entry, sm.Result, bool, bool, bool)     {}
+func (np *testDummyNodeProxy) ApplyConfigChange(pb.ConfigChange, uint64, bool) error { return nil }
+func (np *testDummyNodeProxy) NodeID() uint64                                        { return 1 }
+func (np *testDummyNodeProxy) ClusterID() uint64                                     { return 1 }
+func (np *testDummyNodeProxy) ShouldStop() <-chan struct{}                           { return nil }
 
 func TestNotReadyTakingSnapshotNodeIsSkippedWhenConcurrencyIsNotSupported(t *testing.T) {
 	fs := vfs.GetTestFS()
-	n := &node{ss: &snapshotState{}, initializedC: make(chan struct{})}
+	n := &node{ss: snapshotState{}, initializedC: make(chan struct{})}
 	config := config.Config{ClusterID: 1, NodeID: 1}
 	n.sm = rsm.NewStateMachine(
 		rsm.NewNativeSM(config, &rsm.InMemStateMachine{}, nil),
@@ -1694,7 +1723,7 @@ func TestNotReadyTakingSnapshotNodeIsSkippedWhenConcurrencyIsNotSupported(t *tes
 
 func TestNotReadyTakingSnapshotConcurrentNodeIsNotSkipped(t *testing.T) {
 	fs := vfs.GetTestFS()
-	n := &node{ss: &snapshotState{}, initializedC: make(chan struct{})}
+	n := &node{ss: snapshotState{}, initializedC: make(chan struct{})}
 	config := config.Config{ClusterID: 1, NodeID: 1}
 	n.sm = rsm.NewStateMachine(
 		rsm.NewNativeSM(config, &rsm.ConcurrentStateMachine{}, nil),
@@ -1804,7 +1833,7 @@ func TestEntriesToApply(t *testing.T) {
 				inputs = append(inputs, pb.Entry{Index: i})
 			}
 			n := &node{pushedIndex: 10}
-			results := n.entriesToApply(inputs)
+			results := pb.EntriesToApply(inputs, n.pushedIndex, true)
 			if uint64(len(results)) != tt.resultLength {
 				t.Errorf("%d, result len %d, want %d", idx, len(results), tt.resultLength)
 			}

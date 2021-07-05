@@ -16,11 +16,11 @@ package transport
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/stringutil"
 
 	"github.com/lni/dragonboat/v3/config"
@@ -163,8 +163,9 @@ func (g *NOOPTransport) Start() error {
 	return nil
 }
 
-// Stop stops the NOOPTransport instance.
-func (g *NOOPTransport) Stop() {
+// Close closes the NOOPTransport instance.
+func (g *NOOPTransport) Close() error {
+	return nil
 }
 
 // GetConnection returns a connection.

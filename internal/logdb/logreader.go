@@ -54,7 +54,9 @@ var dn = logutil.DescribeNode
 // into LogDB. This implementation is influenced by CockroachDB's
 // replicaRaftStorage.
 type LogReader struct {
+	sync.Mutex
 	logdb       raftio.ILogDB
+	compactor   pb.ICompactor
 	snapshot    pb.Snapshot
 	state       pb.State
 	markerIndex uint64
@@ -62,7 +64,6 @@ type LogReader struct {
 	nodeID      uint64
 	markerTerm  uint64
 	length      uint64
-	sync.Mutex
 }
 
 var _ raft.ILogDB = (*LogReader)(nil)
@@ -77,6 +78,14 @@ func NewLogReader(clusterID uint64,
 		length:    1,
 	}
 	return l
+}
+
+// SetCompactor sets the compactor or the LogReader instance.
+func (lr *LogReader) SetCompactor(c pb.ICompactor) {
+	if lr.compactor != nil {
+		panic("compactor already set")
+	}
+	lr.compactor = c
 }
 
 func (lr *LogReader) id() string {
@@ -201,21 +210,27 @@ func (lr *LogReader) lastIndex() uint64 {
 	return lr.markerIndex + lr.length - 1
 }
 
+// TODO: check where this method is called, double check whether
+// Unref() got called as expected
+
 // Snapshot returns the metadata of the lastest snapshot.
 func (lr *LogReader) Snapshot() pb.Snapshot {
 	lr.Lock()
 	defer lr.Unlock()
-	return lr.snapshot
+	ss := lr.snapshot
+	if !pb.IsEmptySnapshot(ss) {
+		ss.Ref()
+	}
+	return ss
 }
 
 // ApplySnapshot applies the specified snapshot.
 func (lr *LogReader) ApplySnapshot(snapshot pb.Snapshot) error {
 	lr.Lock()
 	defer lr.Unlock()
-	if lr.snapshot.Index >= snapshot.Index {
-		return raft.ErrSnapshotOutOfDate
+	if err := lr.setSnapshot(snapshot); err != nil {
+		return err
 	}
-	lr.snapshot = snapshot
 	lr.markerIndex = snapshot.Index
 	lr.markerTerm = snapshot.Term
 	lr.length = 1
@@ -226,9 +241,23 @@ func (lr *LogReader) ApplySnapshot(snapshot pb.Snapshot) error {
 func (lr *LogReader) CreateSnapshot(snapshot pb.Snapshot) error {
 	lr.Lock()
 	defer lr.Unlock()
+	return lr.setSnapshot(snapshot)
+}
+
+func (lr *LogReader) setSnapshot(snapshot pb.Snapshot) error {
 	if lr.snapshot.Index >= snapshot.Index {
+		plog.Debugf("%s called setSnapshot, existing %d, new %d",
+			lr.id(), lr.snapshot.Index, snapshot.Index)
 		return raft.ErrSnapshotOutOfDate
 	}
+	snapshot.Load(lr.compactor)
+	if !pb.IsEmptySnapshot(lr.snapshot) {
+		plog.Debugf("%s unref snapshot %d", lr.id(), lr.snapshot.Index)
+		if err := lr.snapshot.Unref(); err != nil {
+			return err
+		}
+	}
+	plog.Debugf("%s set snapshot %d", lr.id(), snapshot.Index)
 	lr.snapshot = snapshot
 	return nil
 }
@@ -272,7 +301,8 @@ func (lr *LogReader) SetRange(firstIndex uint64, length uint64) {
 	case lr.length == offset:
 		lr.length += length
 	default:
-		panic("missing log entry")
+		plog.Panicf("%s gap in log entries, marker %d, len %d, first %d, len %d",
+			lr.id(), lr.markerIndex, lr.length, firstIndex, length)
 	}
 }
 

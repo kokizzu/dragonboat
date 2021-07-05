@@ -39,86 +39,6 @@ const (
 	NoNode uint64 = 0
 )
 
-// SystemCtx is used to identify a ReadIndex operation.
-type SystemCtx struct {
-	Low  uint64
-	High uint64
-}
-
-// ReadyToRead is used to indicate that a previous batch of ReadIndex requests
-// are now ready for read once the entry specified by the Index value is applied in
-// the state machine.
-type ReadyToRead struct {
-	Index     uint64
-	SystemCtx SystemCtx
-}
-
-// UpdateCommit is used to describe how to commit the Update instance to
-// progress the state of raft.
-type UpdateCommit struct {
-	// the last index known to be pushed to rsm for execution.
-	Processed uint64
-	// the last index confirmed to be executed.
-	LastApplied      uint64
-	StableLogTo      uint64
-	StableLogTerm    uint64
-	StableSnapshotTo uint64
-	ReadyToRead      uint64
-}
-
-// Update is a collection of state, entries and messages that are expected to be
-// processed by raft's upper layer to progress the raft node modelled as state
-// machine.
-type Update struct {
-	ClusterID uint64
-	NodeID    uint64
-	// The current persistent state of a raft node. It must be stored onto
-	// persistent storage before any non-replication can be sent to other nodes.
-	// isStateEqual(emptyState) returns true when the state is empty.
-	State
-	// whether CommittedEntries can be applied without waiting for the Update
-	// to be persisted to disk
-	FastApply bool
-	// EntriesToSave are entries waiting to be stored onto persistent storage.
-	EntriesToSave []Entry
-	// CommittedEntries are entries already committed in raft and ready to be
-	// applied by dragonboat applications.
-	CommittedEntries []Entry
-	// Whether there are more committed entries ready to be applied.
-	MoreCommittedEntries bool
-	// Snapshot is the metadata of the snapshot ready to be applied.
-	Snapshot Snapshot
-	// ReadyToReads provides a list of ReadIndex requests ready for local read.
-	ReadyToReads []ReadyToRead
-	// Messages is a list of outgoing messages to be sent to remote nodes.
-	// As stated above, replication messages can be immediately sent, all other
-	// messages must be sent after the persistent state and entries are saved
-	// onto persistent storage.
-	Messages []Message
-	// LastApplied is the actual last applied index reported by the RSM.
-	LastApplied uint64
-	// UpdateCommit contains info on how the Update instance can be committed
-	// to actually progress the state of raft.
-	UpdateCommit UpdateCommit
-	// DroppedEntries is a list of entries dropped when no leader is available
-	DroppedEntries []Entry
-	// DroppedReadIndexes is a list of read index requests  dropped when no leader
-	// is available.
-	DroppedReadIndexes []SystemCtx
-}
-
-// HasUpdate returns a boolean value indicating whether the returned Update
-// instance actually has any update to be processed.
-func (ud *Update) HasUpdate() bool {
-	return !IsEmptyState(ud.State) ||
-		!IsEmptySnapshot(ud.Snapshot) ||
-		len(ud.EntriesToSave) > 0 ||
-		len(ud.CommittedEntries) > 0 ||
-		len(ud.Messages) > 0 ||
-		len(ud.ReadyToReads) > 0 ||
-		len(ud.DroppedEntries) > 0
-}
-
 // IsEmptyState returns a boolean flag indicating whether the given State is
 // empty.
 func IsEmptyState(st State) bool {
@@ -142,35 +62,35 @@ func isStateEqual(a State, b State) bool {
 
 // IsProposal returns a boolean value indicating whether the entry is a
 // regular update entry.
-func (e *Entry) IsProposal() bool {
-	return e.Type == ApplicationEntry ||
-		e.Type == EncodedEntry || e.Type == MetadataEntry
+func (m *Entry) IsProposal() bool {
+	return m.Type == ApplicationEntry ||
+		m.Type == EncodedEntry || m.Type == MetadataEntry
 }
 
 // IsConfigChange returns a boolean value indicating whether the entry is for
 // config change.
-func (e *Entry) IsConfigChange() bool {
-	return e.Type == ConfigChangeEntry
+func (m *Entry) IsConfigChange() bool {
+	return m.Type == ConfigChangeEntry
 }
 
 // IsEmpty returns a boolean value indicating whether the entry is Empty.
-func (e *Entry) IsEmpty() bool {
-	if e.IsConfigChange() {
+func (m *Entry) IsEmpty() bool {
+	if m.IsConfigChange() {
 		return false
 	}
-	if e.IsSessionManaged() {
+	if m.IsSessionManaged() {
 		return false
 	}
-	return len(e.Cmd) == 0
+	return len(m.Cmd) == 0
 }
 
 // IsSessionManaged returns a boolean value indicating whether the entry is
 // session managed.
-func (e *Entry) IsSessionManaged() bool {
-	if e.IsConfigChange() {
+func (m *Entry) IsSessionManaged() bool {
+	if m.IsConfigChange() {
 		return false
 	}
-	if e.ClientID == client.NotSessionManagedClientID {
+	if m.ClientID == client.NotSessionManagedClientID {
 		return false
 	}
 	return true
@@ -178,33 +98,33 @@ func (e *Entry) IsSessionManaged() bool {
 
 // IsNoOPSession returns a boolean value indicating whether the entry is NoOP
 // session managed.
-func (e *Entry) IsNoOPSession() bool {
-	return e.SeriesID == client.NoOPSeriesID
+func (m *Entry) IsNoOPSession() bool {
+	return m.SeriesID == client.NoOPSeriesID
 }
 
 // IsNewSessionRequest returns a boolean value indicating whether the entry is
 // for reqeusting a new client.
-func (e *Entry) IsNewSessionRequest() bool {
-	return !e.IsConfigChange() &&
-		len(e.Cmd) == 0 &&
-		e.ClientID != client.NotSessionManagedClientID &&
-		e.SeriesID == client.SeriesIDForRegister
+func (m *Entry) IsNewSessionRequest() bool {
+	return !m.IsConfigChange() &&
+		len(m.Cmd) == 0 &&
+		m.ClientID != client.NotSessionManagedClientID &&
+		m.SeriesID == client.SeriesIDForRegister
 }
 
 // IsEndOfSessionRequest returns a boolean value indicating whether the entry
 // is for requesting the session to come to an end.
-func (e *Entry) IsEndOfSessionRequest() bool {
-	return !e.IsConfigChange() &&
-		len(e.Cmd) == 0 &&
-		e.ClientID != client.NotSessionManagedClientID &&
-		e.SeriesID == client.SeriesIDForUnregister
+func (m *Entry) IsEndOfSessionRequest() bool {
+	return !m.IsConfigChange() &&
+		len(m.Cmd) == 0 &&
+		m.ClientID != client.NotSessionManagedClientID &&
+		m.SeriesID == client.SeriesIDForUnregister
 }
 
 // IsUpdateEntry returns a boolean flag indicating whether the entry is a
 // regular application entry not used for session management.
-func (e *Entry) IsUpdateEntry() bool {
-	return !e.IsConfigChange() && e.IsSessionManaged() &&
-		!e.IsNewSessionRequest() && !e.IsEndOfSessionRequest()
+func (m *Entry) IsUpdateEntry() bool {
+	return !m.IsConfigChange() && m.IsSessionManaged() &&
+		!m.IsNewSessionRequest() && !m.IsEndOfSessionRequest()
 }
 
 // NewBootstrapInfo creates and returns a new bootstrap record.
@@ -294,8 +214,8 @@ func (snapshot *Snapshot) Validate(fs vfs.IFS) bool {
 }
 
 // Filename returns the filename of the external snapshot file.
-func (f *SnapshotFile) Filename() string {
-	return fmt.Sprintf("external-file-%d", f.FileId)
+func (m *SnapshotFile) Filename() string {
+	return fmt.Sprintf("external-file-%d", m.FileId)
 }
 
 // GetEntrySliceSize returns the upper limit of the entry slice size.
@@ -327,7 +247,7 @@ func GetEntrySliceInMemSize(ents []Entry) uint64 {
 type IChunkSink interface {
 	// return (sent, stopped)
 	Receive(chunk Chunk) (bool, bool)
-	Stop()
+	Close() error
 	ClusterID() uint64
 	ToNodeID() uint64
 }
@@ -343,20 +263,20 @@ var (
 
 // IsLastChunk returns a boolean value indicating whether the chunk is the last
 // chunk of a snapshot.
-func (c Chunk) IsLastChunk() bool {
-	return c.ChunkCount == LastChunkCount || c.ChunkCount == c.ChunkId+1
+func (m Chunk) IsLastChunk() bool {
+	return m.ChunkCount == LastChunkCount || m.ChunkCount == m.ChunkId+1
 }
 
 // IsLastFileChunk returns a boolean value indicating whether the chunk is the
 // last chunk of a snapshot file.
-func (c Chunk) IsLastFileChunk() bool {
-	return c.FileChunkId+1 == c.FileChunkCount
+func (m Chunk) IsLastFileChunk() bool {
+	return m.FileChunkId+1 == m.FileChunkCount
 }
 
 // IsPoisonChunk returns a boolean value indicating whether the chunk is a
 // special poison chunk.
-func (c Chunk) IsPoisonChunk() bool {
-	return c.ChunkCount == PoisonChunkCount
+func (m Chunk) IsPoisonChunk() bool {
+	return m.ChunkCount == PoisonChunkCount
 }
 
 // CanDrop returns a boolean value indicating whether the message can be
@@ -364,4 +284,42 @@ func (c Chunk) IsPoisonChunk() bool {
 func (m *Message) CanDrop() bool {
 	return m.Type != InstallSnapshot &&
 		m.Type != Unreachable && m.Type != SnapshotStatus
+}
+
+// Marshaler is the interface for instances that can be marshalled.
+type Marshaler interface {
+	Marshal() ([]byte, error)
+	MarshalTo([]byte) (int, error)
+}
+
+// Unmarshaler is the interface for instances that can be unmarshalled.
+type Unmarshaler interface {
+	Unmarshal([]byte) error
+}
+
+// MustMarshal marshals the input object or panic if there is any error.
+func MustMarshal(m Marshaler) []byte {
+	data, err := m.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	return data
+}
+
+// MustMarshalTo marshals the input object to the specified buffer or panic
+// if there is any error.
+func MustMarshalTo(m Marshaler, result []byte) []byte {
+	sz, err := m.MarshalTo(result)
+	if err != nil {
+		panic(err)
+	}
+	return result[:sz]
+}
+
+// MustUnmarshal unmarshals the specified object using the provided marshalled
+// data. MustUnmarshal will panic if there is any error.
+func MustUnmarshal(m Unmarshaler, data []byte) {
+	if err := m.Unmarshal(data); err != nil {
+		panic(err)
+	}
 }

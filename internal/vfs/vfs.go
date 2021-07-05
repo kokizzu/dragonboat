@@ -18,10 +18,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"testing"
 
+	"github.com/cockroachdb/errors/oserror"
 	pvfs "github.com/cockroachdb/pebble/vfs"
 
-	gvfs "github.com/lni/goutils/vfs"
+	gvfs "github.com/lni/vfs"
 )
 
 // IFS is the vfs interface used by dragonboat.
@@ -38,6 +40,11 @@ var MemStrictFS IFS = gvfs.NewStrictMem()
 
 // File is the file interface returned by IFS.
 type File = gvfs.File
+
+// NewMemFS creates a in-memory fs.
+func NewMemFS() IFS {
+	return gvfs.NewStrictMem()
+}
 
 // PebbleFS is a wrapper struct that implements the pebble/vfs.FS interface.
 type PebbleFS struct {
@@ -141,13 +148,13 @@ func (p *PebbleFS) PathDir(path string) string {
 // IsNotExist returns a boolean value indicating whether the specified error is
 // to indicate that a file or directory does not exist.
 func IsNotExist(err error) bool {
-	return os.IsNotExist(err)
+	return oserror.IsNotExist(err)
 }
 
 // IsExist returns a boolean value indicating whether the specified error is to
 // indicate that a file or directory already exists.
 func IsExist(err error) bool {
-	return os.IsExist(err)
+	return oserror.IsExist(err)
 }
 
 // TempDir returns the directory use for storing temporary files.
@@ -158,4 +165,9 @@ func TempDir() string {
 // Clean is a wrapper for filepath.Clean.
 func Clean(dir string) string {
 	return filepath.Clean(dir)
+}
+
+// ReportLeakedFD reports leaked file fds.
+func ReportLeakedFD(fs IFS, t *testing.T) {
+	gvfs.ReportLeakedFD(fs, t)
 }

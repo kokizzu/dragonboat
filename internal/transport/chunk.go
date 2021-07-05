@@ -15,18 +15,19 @@
 package transport
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
+	"github.com/cockroachdb/errors"
 	"github.com/lni/goutils/logutil"
 
 	"github.com/lni/dragonboat/v3/internal/fileutil"
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
 	"github.com/lni/dragonboat/v3/internal/settings"
+	"github.com/lni/dragonboat/v3/internal/utils"
 	"github.com/lni/dragonboat/v3/internal/vfs"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
@@ -40,6 +41,8 @@ var (
 	snapshotChunkTimeoutTick = settings.Soft.SnapshotChunkTimeoutTick
 	maxConcurrentSlot        = settings.Soft.MaxConcurrentStreamingSnapshot
 )
+
+var firstError = utils.FirstError
 
 func chunkKey(c pb.Chunk) string {
 	return fmt.Sprintf("%d:%d:%d", c.ClusterId, c.NodeId, c.Index)
@@ -260,7 +263,7 @@ func (c *Chunk) addLocked(chunk pb.Chunk) bool {
 	}
 	removed, err := c.nodeRemoved(chunk)
 	if err != nil {
-		panic(err)
+		panicNow(err)
 	}
 	if removed {
 		c.removeTempDir(chunk)
@@ -274,9 +277,9 @@ func (c *Chunk) addLocked(chunk pb.Chunk) bool {
 		}
 	}
 	if err := c.save(chunk); err != nil {
-		plog.Errorf("failed to save a chunk %s, %v", key, err)
+		err = errors.Wrapf(err, "failed to save chunk %s", key)
 		c.removeTempDir(chunk)
-		panic(err)
+		panicNow(err)
 	}
 	if chunk.IsLastChunk() {
 		plog.Debugf("last chunk %s received", key)
@@ -290,7 +293,7 @@ func (c *Chunk) addLocked(chunk pb.Chunk) bool {
 		}
 		if err := c.finalize(chunk, td); err != nil {
 			c.removeTempDir(chunk)
-			if err != ErrSnapshotOutOfDate {
+			if !errors.Is(err, ErrSnapshotOutOfDate) {
 				plog.Panicf("%s failed when finalizing, %v", key, err)
 			}
 			return false
@@ -319,21 +322,19 @@ func (c *Chunk) save(chunk pb.Chunk) (err error) {
 	}
 	fn := c.fs.PathBase(chunk.Filepath)
 	fp := c.fs.PathJoin(env.GetTempDir(), fn)
-	var f *ChunkFile
+	var f *chunkFile
 	if chunk.FileChunkId == 0 {
-		f, err = CreateChunkFile(fp, c.fs)
+		f, err = createChunkFile(fp, c.fs)
 	} else {
-		f, err = OpenChunkFileForAppend(fp, c.fs)
+		f, err = openChunkFileForAppend(fp, c.fs)
 	}
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
+		err = firstError(err, f.close())
 	}()
-	n, err := f.Write(chunk.Data)
+	n, err := f.write(chunk.Data)
 	if err != nil {
 		return err
 	}
@@ -341,7 +342,7 @@ func (c *Chunk) save(chunk pb.Chunk) (err error) {
 		return io.ErrShortWrite
 	}
 	if chunk.IsLastChunk() || chunk.IsLastFileChunk() {
-		if err := f.Sync(); err != nil {
+		if err := f.sync(); err != nil {
 			return err
 		}
 	}
@@ -408,4 +409,9 @@ func (c *Chunk) toMessage(chunk pb.Chunk,
 
 func (c *Chunk) ssid(chunk pb.Chunk) string {
 	return logutil.DescribeSS(chunk.ClusterId, chunk.NodeId, chunk.Index)
+}
+
+func panicNow(err error) {
+	plog.Panicf("%+v", err)
+	panic(err)
 }

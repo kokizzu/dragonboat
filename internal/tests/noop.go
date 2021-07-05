@@ -17,10 +17,10 @@ package tests
 import (
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"sync/atomic"
 	"time"
 
+	"github.com/lni/dragonboat/v3/internal/fileutil"
 	sm "github.com/lni/dragonboat/v3/statemachine"
 )
 
@@ -80,7 +80,7 @@ func (n *NoOP) RecoverFromSnapshot(r io.Reader,
 	files []sm.SnapshotFile,
 	done <-chan struct{}) error {
 	var sn NoOP
-	data, err := ioutil.ReadAll(r)
+	data, err := fileutil.ReadAll(r)
 	if err != nil {
 		return err
 	}
@@ -88,7 +88,6 @@ func (n *NoOP) RecoverFromSnapshot(r io.Reader,
 	if err != nil {
 		panic("failed to unmarshal snapshot")
 	}
-
 	return nil
 }
 

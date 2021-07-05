@@ -15,16 +15,16 @@
 package upgrade310
 
 import (
-	"math"
-
 	"github.com/lni/dragonboat/v3/config"
 	"github.com/lni/dragonboat/v3/internal/logdb"
 	"github.com/lni/dragonboat/v3/internal/rsm"
 	"github.com/lni/dragonboat/v3/internal/server"
-	"github.com/lni/dragonboat/v3/internal/vfs"
+	"github.com/lni/dragonboat/v3/internal/utils"
 	"github.com/lni/dragonboat/v3/raftio"
 	pb "github.com/lni/dragonboat/v3/raftpb"
 )
+
+var firstError = utils.FirstError
 
 // CanUpgradeToV310 determines whether your production dataset is safe to use
 // the v3.0.3 or higher version of Dragonboat. You need to stop your NodeHost
@@ -44,19 +44,21 @@ import (
 // Note that for the vast majority cases, CanUpgradeToV310 is expected to
 // return true after its first run, which means it is safe to go ahead and
 // upgrade the Dragonboat version.
-func CanUpgradeToV310(nhConfig config.NodeHostConfig) (bool, error) {
+func CanUpgradeToV310(nhConfig config.NodeHostConfig) (result bool, err error) {
 	if nhConfig.DeploymentID == 0 {
 		nhConfig.DeploymentID = 1
 	}
 	if err := nhConfig.Prepare(); err != nil {
 		return false, err
 	}
-	fs := vfs.DefaultFS
+	fs := nhConfig.Expert.FS
 	env, err := server.NewEnv(nhConfig, fs)
 	if err != nil {
 		return false, err
 	}
-	defer env.Stop()
+	defer func() {
+		err = firstError(err, env.Close())
+	}()
 	if err := env.LockNodeHostDir(); err != nil {
 		return false, err
 	}
@@ -64,7 +66,7 @@ func CanUpgradeToV310(nhConfig config.NodeHostConfig) (bool, error) {
 	var ldb raftio.ILogDB
 	if nhConfig.Expert.LogDBFactory == nil {
 		ldb, err = logdb.NewDefaultLogDB(nhConfig,
-			nil, []string{nhDir}, []string{walDir}, fs)
+			nil, []string{nhDir}, []string{walDir})
 	} else {
 		ldb, err = nhConfig.Expert.LogDBFactory.Create(nhConfig,
 			nil, []string{nhDir}, []string{walDir})
@@ -72,25 +74,25 @@ func CanUpgradeToV310(nhConfig config.NodeHostConfig) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	defer ldb.Close()
+	defer func() {
+		err = firstError(err, ldb.Close())
+	}()
 	niList, err := ldb.ListNodeInfo()
 	if err != nil {
 		return false, err
 	}
 	for _, ni := range niList {
-		ssList, err := ldb.ListSnapshots(ni.ClusterID, ni.NodeID, math.MaxUint64)
+		ss, err := ldb.GetSnapshot(ni.ClusterID, ni.NodeID)
 		if err != nil {
 			return false, err
 		}
-		for _, ss := range ssList {
-			if ss.Type == pb.OnDiskStateMachine && ss.OnDiskIndex == 0 {
-				shrunk, err := rsm.IsShrunkSnapshotFile(ss.Filepath, fs)
-				if err != nil {
-					return false, err
-				}
-				if !shrunk {
-					return false, nil
-				}
+		if ss.Type == pb.OnDiskStateMachine && ss.OnDiskIndex == 0 {
+			shrunk, err := rsm.IsShrunkSnapshotFile(ss.Filepath, fs)
+			if err != nil {
+				return false, err
+			}
+			if !shrunk {
+				return false, nil
 			}
 		}
 	}
